@@ -380,9 +380,9 @@ pub const CONTRACT: &[Var] = &[
     op(
         "Web UI",
         "OCSERVE_UI_PACK",
-        "1.18.31",
-        "1.18.31 | 2.0.28",
-        "Which embedded web-UI build is served.",
+        "v1",
+        "v1 | v2 | any 2.x tag",
+        "Which embedded web-UI build is served. `v2` (or a 2.x tag) also turns the v2 runtime on unless OCSERVE_V2=0.",
     ),
     op(
         "Web UI",
@@ -625,7 +625,10 @@ pub fn reference_markdown() -> String {
          | `OPENCODE_ENABLE_EXPERIMENTAL_MODELS` | Serve `alpha` models. `deprecated` models are never served. |\n\
          | `OPENCODE_API_KEY` | Key for the `opencode` provider (takes precedence over the keyless free tier). |\n\
          | `OPENCODE_MODELS_URL` / `OPENCODE_MODELS_PATH` | Catalog source and cache path (same as upstream). |\n\
-         | `OPENCODE_DISABLE_MODELS_FETCH` | Disable catalog refresh. |\n",
+         | `OPENCODE_DISABLE_MODELS_FETCH` | Disable catalog refresh. |\n\
+         | `OPENCODE_CONFIG` | Load an additional explicit config file over the global one (missing file warns; malformed is fatal). |\n\
+         | `OPENCODE_CONFIG_CONTENT` | Inline JSON merged as the final local config layer (launchers inject plugins this way). |\n\
+         | `OPENCODE_CONFIG_DIR` | Config directory (`opencode.json` + auto-discovered `plugin/`/`plugins/`); defaults to `$XDG_CONFIG_HOME/opencode` or `~/.config/opencode`. |\n",
     );
     out
 }

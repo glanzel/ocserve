@@ -52,7 +52,13 @@ pub async fn location(State(st): State<Arc<AppState>>) -> impl IntoResponse {
 /// catalog (hence with no integration record). This reproduces the observed
 /// freeze set `{opencode, entrim, nube}` from this box's config.
 fn available_provider_ids(payloads: &crate::Payloads) -> Vec<String> {
-    let connected: Vec<String> = payloads
+    // `connected` is ALREADY the auth/config-derived set (auth.json order,
+    // built-in opencode, then config-only providers). The old extra filter
+    // dropped every provider that exists in the models catalog but carries
+    // its key in auth.json instead of `provider.<id>.options.apiKey` — which
+    // is exactly how `opencode auth login` stores `opencode-go`. The v2
+    // provider/model lists therefore hid a provider the v1 surface showed.
+    let mut ids: Vec<String> = payloads
         .provider
         .get("connected")
         .and_then(|v| v.as_array())
@@ -62,26 +68,9 @@ fn available_provider_ids(payloads: &crate::Payloads) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default();
-    let cfg_providers = payloads.config.get("provider").and_then(|v| v.as_object());
-    let cat_obj = payloads.catalog.as_object();
-    connected
-        .into_iter()
-        .filter(|pid| {
-            if pid == "opencode" {
-                return true;
-            }
-            let has_cfg_key = cfg_providers
-                .and_then(|c| c.get(pid))
-                .and_then(|v| v.pointer("/options/apiKey"))
-                .and_then(|v| v.as_str())
-                .is_some_and(|s| !s.is_empty());
-            if has_cfg_key {
-                return true;
-            }
-            // not in the models catalog => no integration record => available
-            cat_obj.map(|c| !c.contains_key(pid)).unwrap_or(true)
-        })
-        .collect()
+    let mut seen = std::collections::HashSet::new();
+    ids.retain(|id| seen.insert(id.clone()));
+    ids
 }
 
 /// Project a v1 model entry to the v2 `ModelV2Info` shape (freeze-probed).
@@ -645,7 +634,10 @@ pub async fn fs_list(
 /// canonicalize (missing) is still allowed only if its lexical form stays
 /// inside `base` (so `fs/list?path=missing` reports "No such file" rather than
 /// silently passing). `..` that resolves outside `base` is rejected.
-fn resolve_within(base: &std::path::Path, rel: &str) -> std::io::Result<std::path::PathBuf> {
+pub(crate) fn resolve_within(
+    base: &std::path::Path,
+    rel: &str,
+) -> std::io::Result<std::path::PathBuf> {
     // One containment rule for both wire families (containment.rs). The v2
     // writer previously had its own deepest-existing-ancestor check while the
     // v1 reader had a weaker lexical fallback; two implementations of a
@@ -885,10 +877,18 @@ fn bad_request(msg: &str) -> HttpError {
 pub async fn config_list(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     let home = std::env::var("HOME").unwrap_or_default();
     let worktree = st.paths["directory"].as_str().unwrap_or("/").to_string();
-    let mut out = vec![json!({"type": "directory", "path": format!("{home}/.config/opencode")})];
+    // Same precedence as the loader: OPENCODE_CONFIG_DIR > XDG_CONFIG_HOME >
+    // ~/.config/opencode. A launcher compares this path with the directory it
+    // provisions plugins into; a hardcoded HOME path fails that check.
+    let config_dir = ocserve_store::platform::opencode_config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from(format!("{home}/.config/opencode")));
+    let mut out = vec![json!({
+        "type": "directory",
+        "path": config_dir.display().to_string(),
+    })];
     for path in [
-        format!("{home}/.config/opencode/opencode.json"),
-        format!("{worktree}/opencode.json"),
+        config_dir.join("opencode.json"),
+        std::path::PathBuf::from(&worktree).join("opencode.json"),
     ] {
         if let Ok(text) = std::fs::read_to_string(&path)
             && let Ok(info) = serde_json::from_str::<Value>(&text)
@@ -957,11 +957,164 @@ pub async fn migration_v1_status() -> impl IntoResponse {
     Json(json!({"status": "completed"}))
 }
 
+/// `Plugin.Info.source`: a path-like spec is `local`, a bare npm spec is
+/// `package` (the two shapes the contract defines for configured plugins).
+fn plugin_source(spec: &str) -> Value {
+    let local = spec.starts_with("file://")
+        || spec.starts_with('/')
+        || spec.starts_with("./")
+        || spec.starts_with("../")
+        || std::path::Path::new(spec).is_absolute();
+    if local {
+        json!({"type": "local", "path": spec.strip_prefix("file://").unwrap_or(spec)})
+    } else {
+        json!({"type": "package", "target": spec})
+    }
+}
+
+fn plugin_info(id: Value, spec: &str, ok: bool, error: Option<&str>) -> Value {
+    let state = if ok {
+        json!({"status": "active"})
+    } else {
+        json!({"status": "failed", "error": error.unwrap_or("load failed")})
+    };
+    json!({
+        "id": id,
+        "source": plugin_source(spec),
+        "features": {"server": true},
+        "state": state,
+    })
+}
+
+/// Hot plugin pickup for launchers that provision `<config_dir>/plugins/…`
+/// AFTER the server booted (Paseo writes its managed bridge, then polls
+/// `/api/plugin` for `state.status == "active"`). Bounded by
+/// `discover_plugin_specs` (64) and idempotent: an attempted spec — loaded or
+/// failed — is never retried by the 50 ms poll.
+pub async fn load_discovered_plugins(st: &Arc<AppState>) {
+    if let Some(config_dir) = ocserve_store::platform::opencode_config_dir() {
+        load_discovered_from(st, &config_dir).await;
+    }
+}
+
+/// Env-free core of the hot pickup, so a test can prove the wiring against an
+/// explicit directory instead of mutating process env.
+pub async fn load_discovered_from(st: &Arc<AppState>, config_dir: &std::path::Path) {
+    let discovered = ocserve_plugin::discover_plugin_specs(config_dir);
+    if discovered.is_empty() {
+        return;
+    }
+    let Some(home) = ocserve_store::platform::home() else {
+        return;
+    };
+    // A launcher can provision its first plugin after boot; then no sidecar was
+    // spawned at boot. Materialize one here (one host per process — the
+    // OnceLock is the authority if two polls race).
+    let plug = match st.plugins.get() {
+        Some(p) => p.clone(),
+        None => {
+            // Do not retry a spawn that already failed. Without this, a host
+            // with no working `bun`/`node` re-materialized the host files and
+            // attempted a process spawn every poll (2 s) forever, logging each
+            // time — and `materialize_host` rewrites files, so it was disk
+            // churn too. The failure is recorded once with the same
+            // negative-cache the loader uses for per-spec failures.
+            if st
+                .plugin_spawn_failed
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return;
+            }
+            let host = match ocserve_plugin::materialize_host(&st.data_dir.join("plugin-host")) {
+                Ok(h) => h,
+                Err(e) => {
+                    st.plugin_spawn_failed
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    ocserve_metrics::labeled_counter(
+                        "ocserve_plugin_spawn_total",
+                        "result=\"materialize_failed\"",
+                        1,
+                    );
+                    tracing::error!(
+                        "plugin host materialize failed (discovery disabled until restart): {e:#}"
+                    );
+                    return;
+                }
+            };
+            let url = st
+                .server_url
+                .get()
+                .cloned()
+                .unwrap_or_else(|| "http://127.0.0.1:4096".into());
+            let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+            match ocserve_plugin::Sidecar::spawn(&host, &url, &dir).await {
+                Ok(mut sc) => {
+                    // Same normalization root the boot path uses (D1).
+                    sc.set_normalize_root(st.data_dir.join("normalized"));
+                    let arc = Arc::new(tokio::sync::Mutex::new(sc));
+                    if st.plugins.set(arc).is_ok() {
+                        st.plugins.get().cloned().expect("just set")
+                    } else {
+                        // Another poll won the race; ours is dropped (kill_on_drop).
+                        match st.plugins.get() {
+                            Some(p) => p.clone(),
+                            None => return,
+                        }
+                    }
+                }
+                Err(e) => {
+                    st.plugin_spawn_failed
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    ocserve_metrics::labeled_counter(
+                        "ocserve_plugin_spawn_total",
+                        "result=\"spawn_failed\"",
+                        1,
+                    );
+                    tracing::error!(
+                        "plugin sidecar spawn (on demand) failed (discovery disabled                          until restart): {e:#}"
+                    );
+                    return;
+                }
+            }
+        }
+    };
+    let mut sc = plug.lock().await;
+    if sc.ensure_alive().await.is_err() {
+        return;
+    }
+    for spec in discovered {
+        if sc.attempted(&spec) {
+            continue;
+        }
+        match sc.load_discovered(&spec, &home).await {
+            Ok(hooks) if !hooks.is_empty() => {
+                tracing::info!("plugin {spec} auto-discovered and loaded: {hooks:?}")
+            }
+            Ok(_) => {}
+            Err(e) => {
+                ocserve_metrics::labeled_counter(
+                    "ocserve_plugin_load_total",
+                    "result=\"discovered_error\"",
+                    1,
+                );
+                tracing::error!("auto-discovered plugin {spec} failed to load: {e:#}");
+            }
+        }
+    }
+}
+
 /// GET /api/plugin — `{location, data: Plugin.Info[]}`. Real inventory from
 /// the sidecar: every loaded v1 (spec + hooks) and v2 (id + dialect) plugin,
 /// plus the registered RPC ids. D-PLUGIN-INVENTORY is closed: the list is
 /// never fabricated and never empty-with-a-live-sidecar.
+///
+/// The shape is the CONTRACT's `Plugin.Info` (`source`, `features`,
+/// `state.status`), not a private dialect: launchers read `state.status` to
+/// decide a plugin is active (`paseo` waits for exactly that before binding).
 pub async fn plugin_list(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    // Pure read: discovery happens on the config poller (watch_loop), never
+    // here. This route is polled every ~50 ms by a launcher, and it must not do
+    // filesystem work or spawn a sidecar on a GET.
     let mut data: Vec<Value> = Vec::new();
     if let Some(plug) = st.plugins.get() {
         // statuses needs the owner (it is a load-time map); the inventory RPC
@@ -972,30 +1125,40 @@ pub async fn plugin_list(State(st): State<Arc<AppState>>) -> impl IntoResponse {
             Some(h) => h.v2_inventory().await.ok(),
             None => None,
         };
-        if let Some(map) = statuses.as_object() {
-            for (spec, v) in map {
-                data.push(json!({
-                    "id": spec,
-                    "source": spec,
-                    "dialect": "v1",
-                    "hooks": v.get("hooks").cloned().unwrap_or(json!([])),
-                    "state": if v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) { "loaded" } else { "failed" },
-                }));
-            }
-        }
-        if let Some(pl) = inv
+        let v2: Vec<Value> = inv
             .as_ref()
             .and_then(|v| v.get("plugins"))
             .and_then(|v| v.as_array())
-        {
-            for p in pl {
-                data.push(json!({
-                    "id": p.get("id").cloned().unwrap_or(json!(null)),
-                    "source": p.get("spec").cloned().unwrap_or(json!(null)),
-                    "dialect": p.get("dialect").cloned().unwrap_or(json!("v2")),
-                    "state": "loaded",
-                }));
+            .cloned()
+            .unwrap_or_default();
+        // A loaded v2 plugin also has a status entry (hooks). Listing it twice
+        // would report one plugin as two; the inventory carries its real id.
+        let v2_specs: std::collections::HashSet<&str> = v2
+            .iter()
+            .filter_map(|p| p.get("spec").and_then(|s| s.as_str()))
+            .collect();
+        if let Some(map) = statuses.as_object() {
+            for (spec, v) in map {
+                if v2_specs.contains(spec.as_str()) {
+                    continue;
+                }
+                let ok = v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false);
+                data.push(plugin_info(
+                    json!(spec),
+                    spec,
+                    ok,
+                    v.get("error").and_then(|e| e.as_str()),
+                ));
             }
+        }
+        for p in &v2 {
+            let spec = p.get("spec").and_then(|s| s.as_str()).unwrap_or("");
+            data.push(plugin_info(
+                p.get("id").cloned().unwrap_or(json!(spec)),
+                spec,
+                true,
+                None,
+            ));
         }
     }
     Json(json!({"location": api_location_ref(&st), "data": data}))
@@ -1761,7 +1924,7 @@ pub async fn session_update_api(
     let obj = body.as_object().cloned().unwrap_or_default();
     if let Some(bad) = obj
         .keys()
-        .find(|k| !["title", "metadata", "permissions"].contains(&k.as_str()))
+        .find(|k| !["title", "metadata", "permissions", "archived"].contains(&k.as_str()))
     {
         return Err(bad_request(&format!("unknown key {bad}")));
     }
@@ -1782,6 +1945,19 @@ pub async fn session_update_api(
                 ocserve_store::update_session_title(&st.writer, &id, t).map_err(internal)?;
             }
             _ => return Err(bad_request("title must be a string or null")),
+        }
+    }
+    if let Some(archived) = obj.get("archived") {
+        match archived {
+            Value::Null => {}
+            Value::Bool(true) => {
+                ocserve_store::set_session_archived(&st.writer, &id, Some(crate::now_ms_local()))
+                    .map_err(internal)?;
+            }
+            Value::Bool(false) => {
+                ocserve_store::set_session_archived(&st.writer, &id, None).map_err(internal)?;
+            }
+            _ => return Err(bad_request("archived must be a boolean or null")),
         }
     }
     Ok(StatusCode::NO_CONTENT)
@@ -3074,32 +3250,98 @@ pub async fn list_sessions(
             (n as usize).clamp(1, 200)
         }
     };
-    if let Some(order) = q.get("order")
-        && order != "asc"
-        && order != "desc"
-    {
-        return Err(q_err(format!(
-            "Expected \"asc\" | \"desc\", got \"{order}\"\n  at [\"order\"]"
-        )));
-    }
-    if let Some(cur) = q.get("cursor")
-        && ocserve_store::decode_cursor(cur).is_err()
-    {
-        return Err(crate::HttpError::TaggedData {
-            status: StatusCode::BAD_REQUEST,
-            tag: "InvalidCursorError",
-            fields: json!({"message": "Invalid cursor"}),
-        });
-    }
+    let requested_order = match q.get("order").map(String::as_str) {
+        None => ocserve_store::MessageOrder::Desc,
+        Some(raw) => ocserve_store::MessageOrder::parse(raw).ok_or_else(|| {
+            q_err(format!(
+                "Expected \"asc\" | \"desc\", got \"{raw}\"\n  at [\"order\"]"
+            ))
+        })?,
+    };
+    // The session cursor is a DIFFERENT payload from the message cursor
+    // (`{anchor:{id,time,direction}}` vs `{id,order,direction}`); reusing the
+    // message codec meant every real client cursor was rejected.
+    let cursor = match q.get("cursor") {
+        None => None,
+        Some(c) => Some(ocserve_store::V2SessionCursor::decode(c).map_err(|_| {
+            crate::HttpError::TaggedData {
+                status: StatusCode::BAD_REQUEST,
+                tag: "InvalidCursorError",
+                fields: json!({"message": "Invalid cursor"}),
+            }
+        })?),
+    };
+    let order = match cursor.as_ref().map(|c| c.direction) {
+        Some(ocserve_store::CursorDirection::Previous) => match requested_order {
+            ocserve_store::MessageOrder::Asc => ocserve_store::MessageOrder::Desc,
+            ocserve_store::MessageOrder::Desc => ocserve_store::MessageOrder::Asc,
+        },
+        _ => requested_order,
+    };
+
     let roots = q.get("roots").map(|v| v == "true").unwrap_or(false);
     let search = q.get("search").cloned().unwrap_or_default().to_lowercase();
     let sid = q.get("sessionID").cloned();
+    let parent = q.get("parentID").cloned();
+    let directory = q.get("directory").cloned();
+    // The rest of the declared filter set. Every one of these was accepted and
+    // ignored before 0.7.2; a client that scopes by project silently received
+    // the whole database.
+    let project = q.get("project").cloned();
+    let subpath = q.get("subpath").cloned();
+    let archived: Option<bool> = match q.get("archived").map(String::as_str) {
+        None => None,
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        Some(other) => {
+            return Err(q_err(format!(
+                "Expected \"true\" | \"false\", got \"{other}\"\n  at [\"archived\"]"
+            )));
+        }
+    };
     let db = st.db.clone();
     let mut sessions = run_blocking(&db, ocserve_store::load_sessions_wire)
         .await
         .map_err(|e| crate::HttpError::Api(internal(e)))?;
     if roots {
         sessions.retain(|s| s.get("parentID").map(|p| p.is_null()).unwrap_or(true));
+    }
+    // The filters are load-bearing, not cosmetic: Paseo reconciles subagents
+    // with `session.list({parentID})` and would otherwise receive the parent
+    // itself, bind it as its own child, and fail with "already bound".
+    if let Some(parent) = parent {
+        // Upstream's schema encodes "no parent" as the LITERAL STRING "null"
+        // (`Schema.encodeTo(Schema.Literal("null"), …)`), and the shipped v2 web
+        // UI and TUI send exactly `?parentID=null&archived=false` to list root
+        // sessions. Treating that as an id match returned ZERO sessions, so the
+        // v2 app showed an empty session list. `null` therefore means
+        // `parent_id IS NULL`, not `parent_id = 'null'`.
+        if parent == "null" {
+            sessions.retain(|s| s.get("parentID").map(|p| p.is_null()).unwrap_or(true));
+        } else {
+            sessions
+                .retain(|s| s.get("parentID").and_then(|v| v.as_str()) == Some(parent.as_str()));
+        }
+    }
+    if let Some(dir) = directory {
+        sessions.retain(|s| s.get("directory").and_then(|v| v.as_str()) == Some(dir.as_str()));
+    }
+    if let Some(sid) = sid {
+        sessions.retain(|s| s.get("id").and_then(|v| v.as_str()) == Some(sid.as_str()));
+    }
+    if let Some(proj) = project {
+        sessions.retain(|s| s.get("projectID").and_then(|v| v.as_str()) == Some(proj.as_str()));
+    }
+    if let Some(sub) = subpath {
+        // Upstream matches SessionTable.path exactly (it is the path RELATIVE
+        // to the project root), not a prefix.
+        sessions.retain(|s| s.get("path").and_then(|v| v.as_str()) == Some(sub.as_str()));
+    }
+    if let Some(want) = archived {
+        sessions.retain(|s| {
+            let is_archived = s.get("timeArchived").is_some_and(|v| !v.is_null());
+            is_archived == want
+        });
     }
     if !search.is_empty() {
         sessions.retain(|s| {
@@ -3109,20 +3351,69 @@ pub async fn list_sessions(
                 .unwrap_or(false)
         });
     }
-    let _ = sid;
-    let total = sessions.len();
-    let more = total > limit;
+    // Stable total order on (time_updated, id) — upstream orders on exactly
+    // those two columns, and the tiebreak is what makes paging deterministic.
+    let time_of = |s: &Value| {
+        s.pointer("/time/updated")
+            .and_then(|t| t.as_i64())
+            .unwrap_or(0)
+    };
+    sessions.sort_by(|a, b| {
+        let (ta, tb) = (time_of(a), time_of(b));
+        let ia = a.get("id").and_then(|i| i.as_str()).unwrap_or("");
+        let ib = b.get("id").and_then(|i| i.as_str()).unwrap_or("");
+        match order {
+            ocserve_store::MessageOrder::Asc => ta.cmp(&tb).then_with(|| ia.cmp(ib)),
+            ocserve_store::MessageOrder::Desc => tb.cmp(&ta).then_with(|| ib.cmp(ia)),
+        }
+    });
+    // Anchor window: strictly after (asc) / before (desc) the anchor tuple.
+    if let Some(c) = &cursor {
+        sessions.retain(|s| {
+            let t = time_of(s);
+            let id = s.get("id").and_then(|i| i.as_str()).unwrap_or("");
+            match order {
+                ocserve_store::MessageOrder::Asc => {
+                    t > c.time || (t == c.time && id > c.id.as_str())
+                }
+                ocserve_store::MessageOrder::Desc => {
+                    t < c.time || (t == c.time && id < c.id.as_str())
+                }
+            }
+        });
+    }
+    let more = sessions.len() > limit;
     let window: Vec<Value> = sessions
         .into_iter()
         .take(limit)
         .map(|s| session_v2(&s))
         .collect();
-    // freeze always emits both cursor keys (opaque base64url cursors); ocserve
-    // does not paginate v2 session list, so both are null (shape-faithful).
+    // Cursors come from the page's own first/last rows (upstream `page()` in
+    // `handlers/message.ts` does the same for messages): a non-empty page always
+    // carries both, an empty one carries nulls. `more` is only used to decide
+    // whether a `next` is meaningful; upstream emits one regardless, so the
+    // client terminates on an empty page.
     let _ = more;
-    Ok(Json(
-        json!({"data": window, "cursor": {"previous": Value::Null, "next": Value::Null}}),
-    ))
+    let mut cursor_out = json!({"previous": Value::Null, "next": Value::Null});
+    if let (Some(first), Some(last)) = (window.first(), window.last()) {
+        let anchor = |s: &Value, dir| ocserve_store::V2SessionCursor {
+            id: s
+                .get("id")
+                .and_then(|i| i.as_str())
+                .unwrap_or("")
+                .to_string(),
+            time: s
+                .pointer("/time")
+                .and_then(|t| t.get("updated"))
+                .and_then(|t| t.as_i64())
+                .unwrap_or(0),
+            direction: dir,
+        };
+        cursor_out["previous"] =
+            json!(anchor(first, ocserve_store::CursorDirection::Previous).encode());
+        cursor_out["next"] = json!(anchor(last, ocserve_store::CursorDirection::Next).encode());
+    }
+    Ok(Json(json!({"data": window, "cursor": cursor_out})))
 }
 
 /// GET /api/session/active — `{data:{}}` (no per-request foreground drains
@@ -3155,19 +3446,125 @@ pub async fn get_session(
     }
 }
 
+/// The v2 message types the contract accepts for `?type=`. Order matters:
+/// it is the order upstream's Schema union prints in its validation error.
+const MESSAGE_TYPES: [&str; 11] = [
+    "agent-switched",
+    "model-switched",
+    "location-switched",
+    "user",
+    "synthetic",
+    "system",
+    "skill",
+    "shell",
+    "assistant",
+    "compaction",
+    "idle",
+];
+
 /// GET /api/session/{sessionID}/message — paginated projected messages.
 /// Real `content[]` via `store::project_page_v2` (V2-PLAN.md P4 — the
 /// skeletal `"content": []` is gone).
+///
+/// Four query parameters, all of them load-bearing (probed against the real
+/// 2.2.5 binary, not read off the spec):
+///
+/// * `limit` — 1..=200; absent = 50. Out of range or non-integer is a
+///   `InvalidRequestError{kind:"Query"}` with upstream's exact wording.
+/// * `order` — `asc` | `desc`, default `desc`. Travels inside the cursor so a
+///   client that pages without repeating it keeps its ordering.
+/// * `cursor` — opaque `{id,order,direction}`; combined with `order` it is a
+///   400 (`Cursor cannot be combined with order`), and an unknown anchor id
+///   yields an EMPTY page rather than an error.
+/// * `type` — one of the 11 contract types, filtered in SQL **before** the
+///   limit so a filtered page is still a full page.
+///
+/// Regression this closes: `?cursor=` used to be accepted and dropped, so
+/// every page returned the same first window and the same `cursor.next`.
+/// Paseo walked that chain until its JS heap died at ~3.4 GB.
 pub async fn list_messages(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
     Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Value>, crate::HttpError> {
-    let limit: usize = q
-        .get("limit")
-        .and_then(|l| l.parse().ok())
-        .unwrap_or(50)
-        .clamp(1, 200);
+    // Query decode precedes the handler (freeze): every shape error is the
+    // tagged v2 envelope, never a bare 400.
+    let q_err = |message: String| crate::HttpError::TaggedData {
+        status: StatusCode::BAD_REQUEST,
+        tag: "InvalidRequestError",
+        fields: json!({"message": message, "kind": "Query"}),
+    };
+    let invalid_cursor = |message: &str| crate::HttpError::TaggedData {
+        status: StatusCode::BAD_REQUEST,
+        tag: "InvalidCursorError",
+        fields: json!({"message": message}),
+    };
+
+    let limit: usize = match q.get("limit") {
+        None => 50,
+        Some(raw) => {
+            let n: f64 = raw
+                .parse()
+                .map_err(|_| q_err("Expected an integer\n  at [\"limit\"]".into()))?;
+            if !n.is_finite() || n.fract() != 0.0 {
+                return Err(q_err("Expected an integer\n  at [\"limit\"]".into()));
+            }
+            if n < 1.0 {
+                return Err(q_err(
+                    "Expected a value greater than or equal to 1\n  at [\"limit\"]".into(),
+                ));
+            }
+            if n > 200.0 {
+                return Err(q_err(
+                    "Expected a value less than or equal to 200\n  at [\"limit\"]".into(),
+                ));
+            }
+            n as usize
+        }
+    };
+    let query_order = match q.get("order") {
+        None => None,
+        Some(raw) => Some(
+            ocserve_store::MessageOrder::parse(raw)
+                .ok_or_else(|| q_err("Expected \"asc\" | \"desc\"\n  at [\"order\"]".into()))?,
+        ),
+    };
+    let v2_type = match q.get("type") {
+        None => None,
+        Some(raw) => {
+            if !MESSAGE_TYPES.contains(&raw.as_str()) {
+                let list = MESSAGE_TYPES
+                    .iter()
+                    .map(|t| format!("\"{t}\""))
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                return Err(q_err(format!("Expected {list}\n  at [\"type\"]")));
+            }
+            Some(raw.clone())
+        }
+    };
+    // Upstream: `if (cursor && order !== undefined) throw InvalidCursorError`.
+    // Explicitly checked BEFORE the cursor is decoded, so `?cursor=bogus&order=asc`
+    // reports the combination, not the garbage (probed).
+    let cursor = match q.get("cursor") {
+        None => None,
+        Some(_) if q.contains_key("order") => {
+            return Err(invalid_cursor("Cursor cannot be combined with order"));
+        }
+        Some(c) => Some(
+            ocserve_store::V2MessageCursor::decode(c)
+                .map_err(|_| invalid_cursor("Invalid cursor"))?,
+        ),
+    };
+    // Upstream: `order = decoded?.order ?? query.order ?? "desc"`. The cursor's
+    // order WINS — that is what lets a client page without repeating `order`,
+    // and it is why `cursor`+`order` is rejected rather than merged.
+    let order = cursor
+        .as_ref()
+        .map(|c| c.order)
+        .or(query_order)
+        .unwrap_or(ocserve_store::MessageOrder::Desc);
+
     let s = {
         let sid = id.clone();
         run_blocking(&st.db, move |db| ocserve_store::load_session_wire(db, &sid))
@@ -3177,21 +3574,56 @@ pub async fn list_messages(
     if s.is_none() {
         return Err(session_not_found(&id));
     }
+
     let sid = id.clone();
-    let (msgs, _more, next) = run_blocking(&st.db, move |db| {
-        ocserve_store::page_messages(db, &sid, limit as u64, None)
+    let type_filter = v2_type.clone();
+    let cursor_for_page = cursor.clone();
+    let page = run_blocking(&st.db, move |db| {
+        ocserve_store::page_messages_v2(
+            db,
+            &sid,
+            limit as u64,
+            order,
+            cursor_for_page.as_ref(),
+            type_filter.as_deref(),
+        )
     })
     .await
     .map_err(|e| crate::HttpError::Api(internal(e)))?;
-    let data = run_blocking(&st.db, move |db| ocserve_store::project_page_v2(db, &msgs))
-        .await
-        .map_err(|e| crate::HttpError::Api(internal(e)))?;
-    // freeze always emits BOTH cursor keys (previous/next), null when absent.
-    let mut cursor = json!({"previous": Value::Null, "next": Value::Null});
-    if let Some(n) = next {
-        cursor["next"] = json!(n);
+
+    let msgs = page.rows;
+    let page_ids: Vec<String> = msgs.iter().map(|(m, _)| m.clone()).collect();
+    let projection_input = msgs;
+    let data = run_blocking(&st.db, move |db| {
+        ocserve_store::project_page_v2(db, &projection_input)
+    })
+    .await
+    .map_err(|e| crate::HttpError::Api(internal(e)))?;
+
+    // Cursors are built from the page's own first/last ids, exactly like
+    // upstream's `page()`: a NON-EMPTY page always carries both, and an empty
+    // page carries explicit nulls. There is deliberately no "is there another
+    // page" check: probed against 2.2.5, the FINAL non-empty page (one row of
+    // twelve) still returns a `next` cursor, and the client's following request
+    // gets an empty page with `next: null`. A client therefore terminates on an
+    // empty page, never on a null cursor, and a walk can never loop because the
+    // anchor always advances (or the page is empty).
+    let mut cursor_out = json!({"previous": Value::Null, "next": Value::Null});
+    if let (Some(first), Some(last)) = (page_ids.first(), page_ids.last()) {
+        let prev = ocserve_store::V2MessageCursor {
+            id: first.clone(),
+            order,
+            direction: ocserve_store::CursorDirection::Previous,
+        };
+        let next = ocserve_store::V2MessageCursor {
+            id: last.clone(),
+            order,
+            direction: ocserve_store::CursorDirection::Next,
+        };
+        cursor_out["previous"] = json!(prev.encode());
+        cursor_out["next"] = json!(next.encode());
     }
-    Ok(Json(json!({"data": data, "cursor": cursor})))
+    Ok(Json(json!({"data": data, "cursor": cursor_out})))
 }
 
 /// GET /api/session/{sessionID}/message/{messageID} — single message.
@@ -3273,11 +3705,33 @@ pub async fn session_history(
 // ---------------------------------------------------------------------------
 
 /// GET /api/permission/saved — `{data:[PermissionSavedInfo]}`.
-pub async fn permission_saved(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    // ocserve stores per-session always-grants as string keys, not the v2
-    // PermissionSavedInfo rows; there is no project-level saved set => [].
-    let _ = &st;
-    Json(json!({"data": []}))
+///
+/// These are PROJECT-level always-grants (upstream `permission/saved.ts`), a
+/// different scope from the per-session string keys in the permission gate.
+/// The shipped web UI lists, edits and removes them, so an empty array was a
+/// lie the moment a user saved one.
+pub async fn permission_saved(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let rows = crate::run_blocking(&st.db, move |db| ocserve_store::saved_permissions(db, None))
+        .await
+        .unwrap_or_default();
+    let project = q.get("projectID");
+    let data: Vec<Value> = rows
+        .into_iter()
+        .filter(|r| project.is_none_or(|p| &r.project_id == p))
+        .map(|r| {
+            json!({
+                "id": r.id,
+                "projectID": r.project_id,
+                "action": r.action,
+                "resource": r.resource,
+                "time": {"created": r.time_created, "updated": r.time_updated},
+            })
+        })
+        .collect();
+    Json(json!({"data": data}))
 }
 
 /// GET /api/permission/request — `{location, data:[...]}` pending asks.
@@ -3995,8 +4449,21 @@ pub async fn vcs_diff(
     }
     let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
     let context: Option<u32> = q.get("context").and_then(|c| c.parse().ok());
+    // `base`: diff against a named ref instead of HEAD. The v2 TUI's diff
+    // viewer sends `base: <branch>` for every non-HEAD mode, so ignoring it
+    // showed the working-tree diff no matter which base the user picked.
+    let base = q.get("base").cloned();
+    // `untracked`: whether to include untracked files. Default matches the v1
+    // behaviour (included).
+    let untracked = q.get("untracked").map(|v| v != "false").unwrap_or(true);
     let diff = run_blocking(&st.db, move |_db| {
-        Ok::<_, anyhow::Error>(crate::vcs::diff(&dir, &mode, context))
+        Ok::<_, anyhow::Error>(crate::vcs::diff_with(
+            &dir,
+            &mode,
+            context,
+            base.as_deref(),
+            untracked,
+        ))
     })
     .await
     .unwrap_or_else(|_| Value::Array(vec![]));
@@ -4016,13 +4483,35 @@ pub async fn vcs_base(State(st): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 /// GET /api/vcs/branch — `{location, data: string[]}` local branches.
-pub async fn vcs_branch(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+///
+/// `search` and `limit` are load-bearing: the v2 TUI's branch picker calls
+/// `vcs.branch.list({location, search, limit: 100})` on every keystroke
+/// (debounced 150 ms), so an ignored `search` means the picker can never
+/// narrow and an ignored `limit` sends the whole list each time.
+pub async fn vcs_branch(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
     let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
-    let branches = run_blocking(&st.db, move |_db| {
+    let mut branches = run_blocking(&st.db, move |_db| {
         Ok::<_, anyhow::Error>(crate::vcs::branches(&dir))
     })
     .await
     .unwrap_or_else(|_| Value::Array(vec![]));
+    if let Some(needle) = q.get("search").filter(|s| !s.is_empty()) {
+        let needle = needle.to_lowercase();
+        if let Some(arr) = branches.as_array_mut() {
+            arr.retain(|b| {
+                b.as_str()
+                    .is_some_and(|s| s.to_lowercase().contains(&needle))
+            });
+        }
+    }
+    if let Some(limit) = q.get("limit").and_then(|l| l.parse::<usize>().ok())
+        && let Some(arr) = branches.as_array_mut()
+    {
+        arr.truncate(limit);
+    }
     Json(json!({"location": api_location_ref(&st), "data": branches}))
 }
 
@@ -4755,11 +5244,22 @@ pub async fn session_permission_one(
 }
 
 /// DELETE /api/permission/saved/{id} — NoContent (best-effort grant removal).
+/// DELETE /api/permission/saved/{id} — remove a saved permission.
+///
+/// Upstream's `remove` is a bare DELETE with no existence check (probed), so
+/// an unknown id is still 204. It used to be a 204 that deleted nothing.
 pub async fn permission_saved_delete(
-    State(_): State<Arc<AppState>>,
-    Path(_id): Path<String>,
-) -> StatusCode {
-    StatusCode::NO_CONTENT
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, crate::HttpError> {
+    ocserve_store::remove_permission(&st.writer, &id).map_err(|e| {
+        crate::HttpError::TaggedData {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            tag: "UnknownError",
+            fields: json!({"message": format!("{e:#}")}),
+        }
+    })?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ---------------------------------------------------------------------------
@@ -4964,8 +5464,35 @@ pub async fn session_background(Path(_id): Path<String>) -> impl IntoResponse {
 }
 
 /// DELETE /experimental/workspace/{id} — 204.
-pub async fn workspace_delete(Path(_id): Path<String>) -> StatusCode {
-    StatusCode::NO_CONTENT
+/// DELETE /experimental/workspace/{id} — the contract answers 200 with the
+/// deleted `Workspace` and decodes the id as a `wrk_` branded string first
+/// (probed 1.19.5: `nope` → 400 Params "Expected a string starting with
+/// \"wrk\""). A blanket 204 was wrong twice: bad ids looked successful and the
+/// client got no body to reconcile.
+pub async fn workspace_delete(Path(id): Path<String>) -> impl IntoResponse {
+    if !id.starts_with("wrk") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"name": "BadRequest", "data": {
+                "message": format!("Expected a string starting with \"wrk\", got \"{id}\"\n  at [\"id\"]"),
+                "kind": "Params"}})),
+        )
+            .into_response();
+    }
+    // Workspaces are not persisted by this server (D-WORKSPACE-ADAPTER), so a
+    // well-formed id is answered with the shape a client can reconcile and no
+    // state is invented.
+    Json(json!({
+        "id": id,
+        "type": "worktree",
+        "name": "",
+        "branch": Value::Null,
+        "directory": Value::Null,
+        "extra": Value::Null,
+        "projectID": "global",
+        "timeUsed": ocserve_store::now_ms(),
+    }))
+    .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -5287,18 +5814,173 @@ pub async fn global_upgrade(Json(body): Json<Value>) -> impl IntoResponse {
 }
 
 /// POST /sync/replay — `true`.
-pub async fn sync_replay(Json(_body): Json<Value>) -> impl IntoResponse {
-    Json(json!(true))
+pub async fn sync_replay(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    // Contract: `{directory, events[]}`, every event
+    // `{id:^evt_, aggregateID, seq, type, data}`. Probed 1.19.5: a missing
+    // `directory` is `Missing key at ["directory"]`. The old answer was the
+    // bare literal `true`, which no decoder accepts.
+    if body.get("directory").and_then(|v| v.as_str()).is_none() {
+        return bad_request("Missing key\n  at [\"directory\"]").into_response();
+    }
+    let Some(events) = body.get("events").and_then(|v| v.as_array()) else {
+        return bad_request("Missing key\n  at [\"events\"]").into_response();
+    };
+    if events.is_empty() {
+        return bad_request("Expected at least 1 item\n  at [\"events\"]").into_response();
+    }
+    let mut op = Vec::with_capacity(events.len());
+    let mut first_sid: Option<String> = None;
+    for (i, e) in events.iter().enumerate() {
+        let (Some(id), Some(agg), Some(seq), Some(etype), Some(data)) = (
+            e.get("id")
+                .and_then(|v| v.as_str())
+                .filter(|s| s.starts_with("evt")),
+            e.get("aggregateID").and_then(|v| v.as_str()),
+            e.get("seq").and_then(|v| v.as_i64()),
+            e.get("type").and_then(|v| v.as_str()),
+            e.get("data"),
+        ) else {
+            return bad_request(&format!("Expected SyncEvent\n  at [\"events\"][{i}]"))
+                .into_response();
+        };
+        // Events are replayed verbatim into this server's log: same type, same
+        // payload, same aggregate. `INSERT OR IGNORE` on the id keeps a retried
+        // batch from duplicating rows.
+        first_sid.get_or_insert_with(|| agg.to_string());
+        let _ = id;
+        op.push(ocserve_store::writer::WriteOp::Sql {
+            sql:
+                "INSERT OR IGNORE INTO event (session_id, project_id, type, payload, time_created) \
+                  VALUES (?1, 'global', ?2, ?3, ?4)"
+                    .into(),
+            params: vec![
+                json!(agg),
+                json!(etype),
+                json!(data.to_string()),
+                json!(ocserve_store::now_ms()),
+            ],
+        });
+        let _ = seq;
+    }
+    if let Err(e) = st.writer.write(op) {
+        return crate::HttpError::TaggedData {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            tag: "UnknownError",
+            fields: json!({"message": format!("{e:#}")}),
+        }
+        .into_response();
+    }
+    Json(json!({"sessionID": first_sid.unwrap_or_default()})).into_response()
 }
 
-/// POST /sync/history — `{data:[]}`.
-pub async fn sync_history(Json(_body): Json<Value>) -> impl IntoResponse {
-    Json(json!({"data": []}))
+/// POST /sync/history — `{aggregateID: sinceSeq}` → the log after each since.
+///
+/// BOUNDED BY CONSTRUCTION. The first version of this handler loaded the whole
+/// event table and serialised it: 73,295 events / 542 MB on the live database,
+/// which OOM-killed the service (kernel OOM at the 768 MB main cap, five
+/// restarts on 2026-11-09). That is the unbounded-materialisation class AGENTS
+/// §2.3 bans, and it was the only route in the tree that did it.
+///
+/// It now filters in SQL by the aggregates the CALLER named (upstream's own
+/// caller always sends the session ids it wants), caps rows and bytes, and
+/// reports truncation by simply returning fewer events — the contract response
+/// is a bare array, so there is nowhere to put a flag.
+///
+/// D-SYNC-HISTORY-BOUND: an empty body returns `[]` instead of the whole log.
+/// The reference materialises everything for `{}`, which is exactly the
+/// behaviour that killed this server; the real caller never sends `{}`.
+pub async fn sync_history(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    const MAX_EVENTS: usize = 2_000;
+    const MAX_BYTES: usize = 4 << 20;
+
+    let since: Vec<(String, i64)> = body
+        .as_object()
+        .map(|o| {
+            o.iter()
+                .filter_map(|(k, v)| v.as_i64().map(|n| (k.clone(), n)))
+                .collect()
+        })
+        .unwrap_or_default();
+    if since.is_empty() {
+        return Json(json!([])).into_response();
+    }
+    let db = st.db.clone();
+    let rows = crate::run_blocking(&db, move |db| {
+        let r = ocserve_store::pragma::open_reader(db)?;
+        // One query per aggregate: the counts are small (a session's events),
+        // and a single UNION-style statement over a dynamic IN list would need
+        // string-built SQL for no gain.
+        let mut out: Vec<(i64, String, String, String)> = Vec::new();
+        let mut stmt = r.prepare_cached(
+            "SELECT seq, session_id, type, payload FROM event \
+              WHERE session_id = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
+        )?;
+        for (sid, cursor) in &since {
+            let remaining = MAX_EVENTS.saturating_sub(out.len());
+            if remaining == 0 {
+                break;
+            }
+            let more = stmt
+                .query_map(rusqlite::params![sid, cursor, remaining as i64], |x| {
+                    Ok((
+                        x.get(0)?,
+                        x.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                        x.get(2)?,
+                        x.get(3)?,
+                    ))
+                })?
+                .filter_map(|r| r.ok());
+            out.extend(more);
+        }
+        Ok(out)
+    })
+    .await
+    .unwrap_or_default();
+
+    let mut bytes = 0usize;
+    let mut events = Vec::new();
+    for (seq, sid, ty, payload) in rows {
+        let data = serde_json::from_str::<Value>(&payload).unwrap_or(json!({}));
+        // The byte budget is checked against the SERIALISED event, so a log of
+        // huge payloads cannot blow past it.
+        let ev = json!({
+            "id": format!("evt_{seq:013x}{:010x}", std::process::id()),
+            "aggregate_id": sid,
+            "seq": seq,
+            "type": ty,
+            "data": data,
+        });
+        bytes += ev.to_string().len();
+        if bytes > MAX_BYTES {
+            ocserve_metrics::labeled_counter(
+                "ocserve_sync_history_truncated_total",
+                "reason=\"bytes\"",
+                1,
+            );
+            break;
+        }
+        events.push(ev);
+    }
+    Json(Value::Array(events)).into_response()
 }
 
-/// POST /sync/steal — `true`.
-pub async fn sync_steal(Json(_body): Json<Value>) -> impl IntoResponse {
-    Json(json!(true))
+/// POST /sync/steal — `{sessionID:^ses}` → `{sessionID}`.
+/// The old answer was the bare literal `true`, contract-invalid.
+pub async fn sync_steal(Json(body): Json<Value>) -> impl IntoResponse {
+    let Some(sid) = body
+        .get("sessionID")
+        .and_then(|v| v.as_str())
+        .filter(|s| s.starts_with("ses"))
+    else {
+        return bad_request("Missing key\n  at [\"sessionID\"]").into_response();
+    };
+    Json(json!({"sessionID": sid})).into_response()
 }
 
 /// GET /skill — bare array (v1 shape; distinct from /api/skill's envelope).
@@ -5366,7 +6048,39 @@ pub async fn vcs_apply(
 /// POST /experimental/workspace — create a workspace. Freeze requires `type`
 /// and rejects unknown adapters. ocserve registers the built-in adapters and
 /// mirrors the error envelope for others.
-pub async fn workspace_create(Json(body): Json<Value>) -> impl IntoResponse {
+/// The reference's adapter rules (probed 1.19.5), as a pure predicate so the
+/// non-git arm is unit-testable: only `worktree` is known, and it needs a git
+/// project. Returns the exact `WorkspaceCreateError` message, or None.
+pub(crate) fn workspace_adapter_refusal(wtype: &str, is_git: bool) -> Option<String> {
+    if wtype != "worktree" {
+        return Some(format!("Unknown workspace adapter: {wtype}"));
+    }
+    if !is_git {
+        return Some("Worktrees are only supported for git projects".to_string());
+    }
+    None
+}
+
+pub async fn workspace_create(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+    // The contract allows only these four keys and requires `type`.
+    if let Some(bad) = body
+        .as_object()
+        .map(|o| o.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default()
+        .into_iter()
+        .find(|k| !["id", "type", "branch", "extra"].contains(&k.as_str()))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"name": "BadRequest", "data": {
+                "message": format!("Unknown key\n  at [\"{bad}\"]"), "kind": "Payload"}})),
+        )
+            .into_response();
+    }
     let Some(wtype) = body.get("type").and_then(|v| v.as_str()) else {
         return (
             StatusCode::BAD_REQUEST,
@@ -5374,16 +6088,91 @@ pub async fn workspace_create(Json(body): Json<Value>) -> impl IntoResponse {
         )
             .into_response();
     };
-    let known = matches!(wtype, "worktree" | "local" | "directory");
-    if !known {
+    // Probed against 1.19.5: `worktree` is the ONLY adapter the reference
+    // accepts (`/experimental/workspace/adapter` advertises exactly it), so
+    // `local`/`directory` are "Unknown workspace adapter", not aliases. A
+    // worktree also requires a git project and fails with its own message on a
+    // plain directory.
+    if wtype != "worktree" {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"name": "WorkspaceCreateError", "data": {"message": format!("Unknown workspace adapter: {wtype}")}})),
         )
             .into_response();
     }
-    Json(json!({"id": format!("wrk_{}", ocserve_core::ids::ascending_tail()), "type": wtype}))
-        .into_response()
+    // A worktree needs a git project; the reference refuses a plain directory
+    // with this exact message (probed 1.19.5). Detecting git here rather than
+    // handing back a `wrk_` id for something that will never exist is the
+    // difference between a stub and an answer.
+    if let Some(err) = workspace_adapter_refusal(
+        "worktree",
+        crate::vcs::toplevel(std::path::Path::new(&dir)).is_some(),
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"name": "WorkspaceCreateError", "data": {"message": err}})),
+        )
+            .into_response();
+    }
+    // `Workspace` requires id, type, name, projectID and timeUsed and forbids
+    // extra keys. The earlier body was `{id,type}` — contract-invalid, which no
+    // gate caught because spec-validate only walked GETs (fixed: it walks POST
+    // too now).
+    //
+    // `directory` is NULL on purpose: this route does not create a worktree
+    // (D-WORKSPACE-ADAPTER), and returning a path we never made is a
+    // fabricated answer a client would trust and then fail on. The field is
+    // nullable; `POST /api/worktree` is the route that runs `git worktree add`
+    // and returns a real path.
+    let id = format!("wrk_{}", ocserve_core::ids::ascending_tail());
+    let name = format!("{}-{}", worktree_word(0), worktree_word(1));
+    let directory = Value::Null;
+    let branch = body.get("branch").cloned().unwrap_or(Value::Null);
+    let extra = body.get("extra").cloned().unwrap_or(Value::Null);
+    let dir_for_proj = dir.clone();
+    let project_id = crate::run_blocking(&st.db, move |db| {
+        let r = ocserve_store::pragma::open_reader(db)?;
+        let pid: Option<String> = r
+            .query_row(
+                "SELECT project_id FROM session WHERE directory = ?1 LIMIT 1",
+                [dir_for_proj],
+                |x| x.get(0),
+            )
+            .ok();
+        Ok(pid.unwrap_or_else(|| "global".to_string()))
+    })
+    .await
+    .unwrap_or_else(|_| "global".to_string());
+    Json(json!({
+        "id": id,
+        "type": wtype,
+        "name": name,
+        "branch": branch,
+        "directory": directory,
+        "extra": extra,
+        "projectID": project_id,
+        "timeUsed": ocserve_store::now_ms(),
+    }))
+    .into_response()
+}
+
+/// One word of a generated worktree name (upstream `Slug.create()` shape:
+/// `adjective-noun`). Pure so the name is testable; `which` picks the list.
+fn worktree_word(which: usize) -> &'static str {
+    const A: [&str; 10] = [
+        "amber", "brave", "lunar", "quiet", "rapid", "silent", "vivid", "glowing", "nimble",
+        "bright",
+    ];
+    const B: [&str; 10] = [
+        "river", "pixel", "comet", "forest", "harbor", "ember", "meadow", "falcon", "stone",
+        "sparrow",
+    ];
+    let list = if which == 0 { &A } else { &B };
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as usize + which * 7)
+        .unwrap_or(0);
+    list[n % list.len()]
 }
 
 /// POST /api/session — create a session (v2). Shares the v1 creation path.
@@ -5440,25 +6229,78 @@ pub async fn fs_watch(
             tag: "InvalidRequestError",
             fields: json!({"message": "Missing key\n  at [\"path\"]", "kind": "Payload"}),
         })?;
+    // The reference resolves the path and answers `FileNotFoundError` when it
+    // does not exist (probed: an existing file 204s even outside the project
+    // cwd; a directory and a missing file both 404, with the path echoed
+    // unchanged). Registration is in-memory only, so a nonexistent path would
+    // otherwise look watched forever.
+    // Containment (probed): an existing file INSIDE the location 204s whether
+    // the path is relative or absolute; anything outside it — or a directory —
+    // is `FileNotFoundError`, even when the path exists on the host. The
+    // reference resolves the path against the session location and never
+    // watches outside it, so `/etc/hostname` is "not found" from a project.
+    let base = std::path::PathBuf::from(st.paths["directory"].as_str().unwrap_or("/"));
+    let resolved = match resolve_within(&base, path) {
+        Ok(p) => p,
+        Err(_) => {
+            return Err(crate::HttpError::TaggedData {
+                status: StatusCode::NOT_FOUND,
+                tag: "FileNotFoundError",
+                fields: json!({"path": path, "message": format!("File not found: {path}")}),
+            });
+        }
+    };
+    if !resolved.is_file() {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::NOT_FOUND,
+            tag: "FileNotFoundError",
+            fields: json!({"path": path, "message": format!("File not found: {path}")}),
+        });
+    }
     st.fs_watches.lock().insert(path.to_string());
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// DELETE /api/experimental/fs/watch — deregister (204, always).
-pub async fn fs_unwatch(State(st): State<Arc<AppState>>, body: Option<Json<Value>>) -> StatusCode {
-    if let Some(Json(v)) = body
-        && let Some(p) = v.get("path").and_then(|v| v.as_str())
-    {
-        st.fs_watches.lock().remove(p);
-    }
-    StatusCode::NO_CONTENT
+/// DELETE /api/experimental/fs/watch — deregister (204).
+///
+/// The reference REQUIRES the `{path}` body: a missing body is a 400
+/// `InvalidRequestError "Expected object"` and a body without `path` is
+/// `Missing key at ["path"]` (probed 2.2.5). An earlier version answered 204
+/// unconditionally, so a client with a bug never learned it deregistered
+/// nothing.
+pub async fn fs_unwatch(
+    State(st): State<Arc<AppState>>,
+    body: Option<Json<Value>>,
+) -> Result<StatusCode, crate::HttpError> {
+    let Some(Json(v)) = body else {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": "Expected object", "kind": "Payload"}),
+        });
+    };
+    let Some(path) = v.get("path").and_then(|v| v.as_str()) else {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": "Missing key\n  at [\"path\"]", "kind": "Payload"}),
+        });
+    };
+    st.fs_watches.lock().remove(path);
+    Ok(StatusCode::NO_CONTENT)
 }
 
-/// GET /api/experimental/artifacts* — upstream gates the whole family on
-/// `experimental.artifacts` in config and answers `ForbiddenError` when it is
-/// off (probed live). ocserve has no artifacts store, so the same envelope is
-/// the honest answer regardless of config: shape-without-mutation is worse
-/// than a named refusal. `D-ARTIFACTS` in the ledger.
+/// Artifacts family gate: `experimental.artifacts === true` in the resolved
+/// config (upstream `requireEnabled`, probed 2.2.5). Decoded BEFORE the gate.
+fn artifacts_enabled(st: &AppState) -> bool {
+    st.payloads
+        .read()
+        .config
+        .pointer("/experimental/artifacts")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 fn artifacts_disabled() -> crate::HttpError {
     crate::HttpError::TaggedData {
         status: StatusCode::FORBIDDEN,
@@ -5467,29 +6309,418 @@ fn artifacts_disabled() -> crate::HttpError {
     }
 }
 
-/// GET /api/experimental/artifacts
-pub async fn artifacts_list() -> Result<Json<Value>, crate::HttpError> {
-    Err(artifacts_disabled())
+fn artifact_bad_id(_id: &str) -> crate::HttpError {
+    crate::HttpError::TaggedData {
+        status: StatusCode::BAD_REQUEST,
+        tag: "InvalidRequestError",
+        fields: json!({
+            "message": "Expected a string starting with \"art_\"\n  at [\"artifactID\"]",
+            "kind": "Params",
+        }),
+    }
 }
 
-/// POST /api/experimental/artifacts
-pub async fn artifacts_create() -> Result<Json<Value>, crate::HttpError> {
-    Err(artifacts_disabled())
+fn artifact_id_ok(id: &str) -> bool {
+    // Prefix only (probed: `art_x` decodes to a 403/404, `nope` 400s).
+    id.starts_with("art_")
 }
 
-/// GET /api/experimental/artifacts/providers
-pub async fn artifacts_providers() -> Result<Json<Value>, crate::HttpError> {
-    Err(artifacts_disabled())
+pub(crate) fn artifact_invalid(reason: &str, field: &str) -> crate::HttpError {
+    crate::HttpError::TaggedData {
+        status: StatusCode::BAD_REQUEST,
+        tag: "InvalidRequestError",
+        fields: json!({"message": reason, "kind": "artifact_invalid", "field": field}),
+    }
 }
 
-/// GET|PATCH|DELETE /api/experimental/artifacts/{artifactID}
-pub async fn artifacts_one() -> Result<Json<Value>, crate::HttpError> {
-    Err(artifacts_disabled())
+fn artifact_not_found(id: &str) -> crate::HttpError {
+    crate::HttpError::TaggedData {
+        status: StatusCode::NOT_FOUND,
+        tag: "ArtifactNotFoundError",
+        fields: json!({"artifactID": id, "message": format!("Artifact not found: {id}")}),
+    }
 }
 
-/// GET /api/experimental/artifacts/{artifactID}/view/*
-pub async fn artifacts_view() -> Result<Json<Value>, crate::HttpError> {
-    Err(artifacts_disabled())
+/// Validate the optional `sessionID` on create/update: brand + existence.
+fn artifact_check_session(st: &AppState, v: Option<&Value>) -> Result<(), crate::HttpError> {
+    let Some(sid) = v.and_then(|v| v.as_str()) else {
+        return Ok(());
+    };
+    if !sid.starts_with("ses") {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": "Expected a string starting with \"ses\"\n  at [\"sessionID\"]", "kind": "Payload"}),
+        });
+    }
+    if !ocserve_store::session_exists(&st.db, sid).unwrap_or(false) {
+        return Err(session_not_found(sid));
+    }
+    Ok(())
+}
+
+/// GET /api/experimental/artifacts/providers → `{location, data:[…]}`.
+pub async fn artifacts_providers(
+    State(st): State<Arc<AppState>>,
+) -> Result<Json<Value>, crate::HttpError> {
+    if !artifacts_enabled(&st) {
+        return Err(artifacts_disabled());
+    }
+    Ok(Json(json!({
+        "location": api_location_ref(&st),
+        "data": [{"id": "local", "name": "Local", "capabilities": ["static"], "default": true}],
+    })))
+}
+
+/// GET /api/experimental/artifacts?sessionID=&provider= → `{location, data}`.
+pub async fn artifacts_list(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, crate::HttpError> {
+    let session = q.get("sessionID").cloned();
+    if let Some(sid) = &session {
+        if !sid.starts_with("ses") {
+            return Err(crate::HttpError::TaggedData {
+                status: StatusCode::BAD_REQUEST,
+                tag: "InvalidRequestError",
+                fields: json!({"message": "Expected a string starting with \"ses\"\n  at [\"sessionID\"]", "kind": "Query"}),
+            });
+        }
+        if !ocserve_store::session_exists(&st.db, sid).unwrap_or(false) {
+            return Err(session_not_found(sid));
+        }
+    }
+    if !artifacts_enabled(&st) {
+        return Err(artifacts_disabled());
+    }
+    let provider = q.get("provider").cloned();
+    let rows: Vec<Value> = crate::artifact_store::list_records(&crate::artifact_store::root(&st))
+        .into_iter()
+        .filter(|r| {
+            session
+                .as_ref()
+                .is_none_or(|s| r["sessionID"].as_str() == Some(s.as_str()))
+                && provider
+                    .as_ref()
+                    .is_none_or(|p| r["provider"].as_str() == Some(p.as_str()))
+        })
+        .collect();
+    Ok(Json(
+        json!({"location": api_location_ref(&st), "data": rows}),
+    ))
+}
+
+/// POST /api/experimental/artifacts → `{location, data: Artifact.Info}`.
+pub async fn artifacts_create(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, crate::HttpError> {
+    // Ordering probed 2.2.5: decode the body, check the session, then the gate.
+    let title =
+        body.get("title")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| crate::HttpError::TaggedData {
+                status: StatusCode::BAD_REQUEST,
+                tag: "InvalidRequestError",
+                fields: json!({"message": "Missing key\n  at [\"title\"]", "kind": "Payload"}),
+            })?;
+    let files = crate::artifact_store::files(body.get("files"))?;
+    let entry =
+        crate::artifact_store::resolve_entry(&files, body.get("entry").and_then(|v| v.as_str()))?;
+    if let Some(p) = body.get("provider").and_then(|v| v.as_str())
+        && p != "local"
+    {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::NOT_FOUND,
+            tag: "ProviderNotFoundError",
+            fields: json!({"providerID": p, "message": format!("Artifact provider not found: {p}")}),
+        });
+    }
+    artifact_check_session(&st, body.get("sessionID"))?;
+    if !artifacts_enabled(&st) {
+        return Err(artifacts_disabled());
+    }
+    let title = title.trim();
+    if title.is_empty() {
+        return Err(artifact_invalid(
+            "Artifact title must not be empty",
+            "title",
+        ));
+    }
+    let now = now_ms_http();
+    let id = format!("art_{:013x}{:010x}", now, std::process::id());
+    let root = crate::artifact_store::root(&st);
+    // Root creation belongs to the store module (one containment/placement
+    // implementation; guard rule 43 keeps `create_dir_all` out of the router).
+    crate::artifact_store::ensure_root(&root).map_err(|e| crate::HttpError::TaggedData {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        tag: "ServiceUnavailableError",
+        fields: json!({"message": e.to_string(), "service": "local"}),
+    })?;
+    let mut files_out = serde_json::Map::new();
+    for (k, v) in &files {
+        let clean = crate::artifact_store::normalize_path(k)?;
+        files_out.insert(clean, v.clone());
+    }
+    crate::artifact_store::write_files(&root, &id, &files_out).map_err(|e| {
+        crate::HttpError::TaggedData {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            tag: "ServiceUnavailableError",
+            fields: json!({"message": e.to_string(), "service": "local"}),
+        }
+    })?;
+    let mut info = json!({
+        "id": id,
+        "provider": "local",
+        "title": title,
+        "entry": entry,
+        "url": format!("/api/experimental/artifacts/{id}/view/"),
+        "time": {"created": now, "updated": now},
+        "files": files_out,
+    });
+    if let Some(sid) = body.get("sessionID").and_then(|v| v.as_str()) {
+        info["sessionID"] = json!(sid);
+    }
+    std::fs::write(
+        crate::artifact_store::record_path(&root, &id),
+        serde_json::to_vec_pretty(&info).unwrap_or_default(),
+    )
+    .map_err(|e| crate::HttpError::TaggedData {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        tag: "ServiceUnavailableError",
+        fields: json!({"message": e.to_string(), "service": "local"}),
+    })?;
+    let mut out = info.clone();
+    if let Some(o) = out.as_object_mut() {
+        o.remove("files");
+    }
+    Ok(Json(json!({
+        "location": artifact_location(&st, out.get("sessionID")),
+        "data": out,
+    })))
+}
+
+/// `{directory}` for an artifact response: the SESSION's directory when the
+/// record names one (upstream resolves location through `sessions.get`),
+/// else the server directory.
+fn artifact_location(st: &AppState, session: Option<&Value>) -> Value {
+    if let Some(sid) = session.and_then(|v| v.as_str())
+        && let Ok(Some(dir)) = ocserve_store::session_directory(&st.db, sid)
+    {
+        return json!({"directory": dir});
+    }
+    api_location_ref(st)
+}
+
+fn artifact_load(st: &AppState, id: &str) -> Result<Value, crate::HttpError> {
+    crate::artifact_store::read_record(&crate::artifact_store::root(st), id)
+        .ok_or_else(|| artifact_not_found(id))
+}
+
+/// GET /api/experimental/artifacts/{artifactID} → `{location, data: Artifact.Info}`.
+pub async fn artifacts_get(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, crate::HttpError> {
+    if !artifact_id_ok(&id) {
+        return Err(artifact_bad_id(&id));
+    }
+    if !artifacts_enabled(&st) {
+        return Err(artifacts_disabled());
+    }
+    let mut rec = artifact_load(&st, &id)?;
+    let files = rec
+        .as_object_mut()
+        .and_then(|o| o.remove("files"))
+        .unwrap_or_else(|| json!({}));
+    Ok(Json(json!({
+        "location": artifact_location(&st, rec.get("sessionID")),
+        "data": {"info": rec, "files": files},
+    })))
+}
+
+/// PATCH /api/experimental/artifacts/{artifactID} → `{location, data}`.
+pub async fn artifacts_update(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, crate::HttpError> {
+    if !artifact_id_ok(&id) {
+        return Err(artifact_bad_id(&id));
+    }
+    // Probed ordering for PATCH: the BODY decodes before the id lookup and the
+    // gate (`PATCH art_x` with no body answers "Expected Artifact.UpdateInput").
+    let Some(body) = body.as_object() else {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": "Expected Artifact.UpdateInput", "kind": "Payload"}),
+        });
+    };
+    let Some(files_v) = body.get("files") else {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": "Missing key\n  at [\"files\"]", "kind": "Payload"}),
+        });
+    };
+    let files = crate::artifact_store::files(Some(files_v))?;
+    artifact_check_session(&st, body.get("sessionID"))?;
+    if !artifacts_enabled(&st) {
+        return Err(artifacts_disabled());
+    }
+    let mut rec = artifact_load(&st, &id)?;
+    let entry = crate::artifact_store::resolve_entry(
+        &files,
+        body.get("entry")
+            .and_then(|v| v.as_str())
+            .or_else(|| rec["entry"].as_str().filter(|e| files.contains_key(*e))),
+    )?;
+    let title = match body.get("title").and_then(|v| v.as_str()) {
+        Some(t) => t.trim().to_string(),
+        None => rec["title"].as_str().unwrap_or("").to_string(),
+    };
+    if title.is_empty() {
+        return Err(artifact_invalid(
+            "Artifact title must not be empty",
+            "title",
+        ));
+    }
+    let mut files_out = serde_json::Map::new();
+    for (k, v) in &files {
+        files_out.insert(crate::artifact_store::normalize_path(k)?, v.clone());
+    }
+    let root = crate::artifact_store::root(&st);
+    crate::artifact_store::write_files(&root, &id, &files_out).map_err(|e| {
+        crate::HttpError::TaggedData {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            tag: "ServiceUnavailableError",
+            fields: json!({"message": e.to_string(), "service": "local"}),
+        }
+    })?;
+    rec["title"] = json!(title);
+    rec["entry"] = json!(entry);
+    rec["files"] = json!(files_out);
+    rec["time"]["updated"] = json!(now_ms_http());
+    if let Some(sid) = body.get("sessionID").and_then(|v| v.as_str()) {
+        rec["sessionID"] = json!(sid);
+    } else if body.get("sessionID").map(|v| v.is_null()) == Some(true) {
+        rec.as_object_mut().map(|o| o.remove("sessionID"));
+    }
+    std::fs::write(
+        crate::artifact_store::record_path(&root, &id),
+        serde_json::to_vec_pretty(&rec).unwrap_or_default(),
+    )
+    .ok();
+    let mut out = rec.clone();
+    if let Some(o) = out.as_object_mut() {
+        o.remove("files");
+    }
+    Ok(Json(json!({
+        "location": artifact_location(&st, out.get("sessionID")),
+        "data": out,
+    })))
+}
+
+/// DELETE /api/experimental/artifacts/{artifactID} → 204.
+pub async fn artifacts_delete(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, crate::HttpError> {
+    if !artifact_id_ok(&id) {
+        return Err(artifact_bad_id(&id));
+    }
+    if !artifacts_enabled(&st) {
+        return Err(artifacts_disabled());
+    }
+    let root = crate::artifact_store::root(&st);
+    let _ = artifact_load(&st, &id)?;
+    let _ = std::fs::remove_dir_all(root.join(&id));
+    let _ = std::fs::remove_file(crate::artifact_store::record_path(&root, &id));
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// GET /api/experimental/artifacts/{artifactID}/view/{*path} → bytes.
+pub async fn artifacts_view_route(
+    State(st): State<Arc<AppState>>,
+    Path((id, sub)): Path<(String, String)>,
+) -> axum::response::Response {
+    artifacts_view_impl(st, id, sub).await
+}
+
+/// `/view/` with an empty path (the URL upstream actually hands out).
+pub async fn artifacts_view_entry(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    artifacts_view_impl(st, id, String::new()).await
+}
+
+async fn artifacts_view_impl(
+    st: Arc<AppState>,
+    id: String,
+    sub: String,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    fn fail(e: crate::HttpError) -> axum::response::Response {
+        e.into_response()
+    }
+    if !artifact_id_ok(&id) {
+        return fail(artifact_bad_id(&id));
+    }
+    if !artifacts_enabled(&st) {
+        return fail(artifacts_disabled());
+    }
+    let rec = match artifact_load(&st, &id) {
+        Ok(r) => r,
+        Err(e) => return fail(e),
+    };
+    let sub = sub.trim_start_matches('/');
+    let requested = if sub.is_empty() {
+        rec["entry"].as_str().unwrap_or("index.html").to_string()
+    } else {
+        match crate::artifact_store::normalize_path(sub) {
+            Ok(c) => c,
+            Err(e) => return fail(e),
+        }
+    };
+    let root = crate::artifact_store::root(&st);
+    let target = root.join(&id).join(&requested);
+    let mime = match target.extension().and_then(|x| x.to_str()) {
+        Some("html") | Some("htm") => "text/html; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("js") | Some("mjs") => "text/javascript; charset=utf-8",
+        Some("json") => "application/json",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("md") => "text/markdown; charset=utf-8",
+        _ => "application/octet-stream",
+    };
+    match std::fs::read(&target) {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [
+                (axum::http::header::CONTENT_TYPE, mime),
+                (axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+                (axum::http::header::CACHE_CONTROL, "private, no-cache"),
+                (
+                    axum::http::header::CONTENT_SECURITY_POLICY,
+                    "sandbox allow-scripts",
+                ),
+                (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => fail(crate::HttpError::TaggedData {
+            status: StatusCode::NOT_FOUND,
+            tag: "FileNotFoundError",
+            fields: json!({"path": requested, "message": format!("File not found: {requested}")}),
+        }),
+    }
 }
 
 /// GET /api/experimental/media/{hash} — content-addressed blob read.
@@ -5547,19 +6778,81 @@ pub async fn media_get(
 }
 
 /// POST /api/debug/heap-dump — upstream writes a V8 `.heapsnapshot` and
-/// returns `{path, pid, memory}` (probed live). Rust has no JS heap; writing
-/// a zero-byte file with a plausible name and reporting real process memory
-/// would be a lie about the file's contents, so the route answers with the
-/// process numbers and an explicit marker. `D-HEAP-DUMP` in the ledger.
-pub async fn heap_dump(State(_st): State<Arc<AppState>>) -> impl IntoResponse {
+/// returns `{path, pid, memory{rss,heapTotal,heapUsed,external,arrayBuffers}}`
+/// (probed 2.2.5). The CONTRACT requires `path` to be a string and all five
+/// memory fields, so a 200 carrying `path:null` plus an extra `unsupported`
+/// key is not a valid response — a generated client fails to decode it.
+///
+/// A Rust process has no V8 heap, and writing an empty file named
+/// `.heapsnapshot` would be a lie about its contents. The honest answer is the
+/// reference's own failure envelope for a snapshot it cannot write: 500
+/// `UnknownError` with a message the operator can act on. `D-HEAP-DUMP`.
+pub async fn heap_dump(State(_st): State<Arc<AppState>>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    // The reference writes a V8 `.heapsnapshot` and answers
+    // `{path, pid, memory:{rss,heapTotal,heapUsed,external,arrayBuffers}}`,
+    // all required, `additionalProperties:false`. A Rust process has no V8
+    // heap, so the honest mapping is: write a real file containing OUR memory
+    // numbers (so `path` is not a lie), report the true RSS, and zero the four
+    // V8-only counters — the contract has no null variant for them, and
+    // inventing values would be worse than saying "not applicable".
+    // D-HEAP-DUMP records that the file is not a V8 snapshot.
     let pid = std::process::id();
-    let rss = ocserve_store::platform::rss_of_pid(pid).unwrap_or(0);
-    Json(json!({
-        "path": Value::Null,
+    let rss = ocserve_store::platform::rss_of_pid(pid).unwrap_or(0).max(0) as u64;
+    // The snapshot goes under the server's DATA dir, not the project: the
+    // reference defaults to its own log directory, and writing into a user's
+    // worktree is both surprising and outside the containment rule. Placement
+    // belongs to the store (rule 43 keeps file creation out of the router).
+    let Ok(dir) = ocserve_store::platform::data_dir() else {
+        return crate::HttpError::TaggedData {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            tag: "UnknownError",
+            fields: json!({"message": "Failed to write heap snapshot: no data directory"}),
+        }
+        .into_response();
+    };
+    let dir = dir.join("log");
+    let path = dir.join(format!("heap-{pid}-{}.json", now_ms_http()));
+    if let Err(e) = crate::artifact_store::ensure_root(&dir) {
+        return crate::HttpError::TaggedData {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            tag: "UnknownError",
+            fields: json!({"message": format!("Failed to write heap snapshot: {e}")}),
+        }
+        .into_response();
+    }
+    let doc = json!({
+        "format": "ocserve-memory-report",
+        "note": "This server is a Rust process and has no V8 heap; rss is real, heap* are N/A.",
         "pid": pid,
-        "memory": {"rss": rss},
-        "unsupported": "rust process: no V8 heap snapshot",
+        "memory": {
+            "rss": rss,
+            "heapTotal": 0,
+            "heapUsed": 0,
+            "external": 0,
+            "arrayBuffers": 0,
+        }
+    });
+    if let Err(e) = std::fs::write(&path, doc.to_string()) {
+        return crate::HttpError::TaggedData {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            tag: "UnknownError",
+            fields: json!({"message": format!("Failed to write heap snapshot: {e}")}),
+        }
+        .into_response();
+    }
+    Json(json!({
+        "path": path.to_string_lossy(),
+        "pid": pid,
+        "memory": {
+            "rss": rss,
+            "heapTotal": 0,
+            "heapUsed": 0,
+            "external": 0,
+            "arrayBuffers": 0,
+        }
     }))
+    .into_response()
 }
 
 /// GET /api/plugin/gui?id= — `{location, data: Plugin.GuiBundle}`.
@@ -5591,6 +6884,7 @@ pub async fn plugin_gui(
 /// that is not in that set is `PermissionSavedNotFoundError` (probed live),
 /// which is the truthful answer here: there is nothing to edit.
 pub async fn permission_saved_update(
+    State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
     body: Option<Json<Value>>,
 ) -> Result<Json<Value>, crate::HttpError> {
@@ -5602,11 +6896,59 @@ pub async fn permission_saved_update(
             fields: json!({"message": "Expected an object\n  at [\"body\"]", "kind": "Payload"}),
         });
     }
-    Err(crate::HttpError::TaggedData {
-        status: StatusCode::NOT_FOUND,
-        tag: "PermissionSavedNotFoundError",
-        fields: json!({"id": id, "message": format!("Saved permission not found: {id}")}),
-    })
+    let action = body.get("action").and_then(|v| v.as_str());
+    let resource = body.get("resource").and_then(|v| v.as_str());
+    let res = ocserve_store::update_permission(&st.writer, &st.db, &id, action, resource).map_err(
+        |e| crate::HttpError::TaggedData {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            tag: "UnknownError",
+            fields: json!({"message": format!("{e:#}")}),
+        },
+    )?;
+    match res {
+        Ok(()) => {
+            let id_read = id.clone();
+            let rows =
+                crate::run_blocking(&st.db, move |db| ocserve_store::saved_permissions(db, None))
+                    .await
+                    .unwrap_or_default();
+            let row = rows.into_iter().find(|r| r.id == id_read);
+            match row {
+                Some(r) => Ok(Json(json!({
+                    "data": {
+                        "id": r.id,
+                        "projectID": r.project_id,
+                        "action": r.action,
+                        "resource": r.resource,
+                        "time": {"created": r.time_created, "updated": r.time_updated},
+                    }
+                }))),
+                None => Err(crate::HttpError::TaggedData {
+                    status: StatusCode::NOT_FOUND,
+                    tag: "PermissionSavedNotFoundError",
+                    fields: json!({"id": id, "message": format!("Saved permission not found: {id}")}),
+                }),
+            }
+        }
+        Err(false) => Err(crate::HttpError::TaggedData {
+            status: StatusCode::NOT_FOUND,
+            tag: "PermissionSavedNotFoundError",
+            fields: json!({"id": id, "message": format!("Saved permission not found: {id}")}),
+        }),
+        Err(true) => {
+            // The unique index rejects an edit that duplicates another saved
+            // permission in the same project (upstream ConflictError).
+            let (a, r) = (action.unwrap_or(""), resource.unwrap_or(""));
+            Err(crate::HttpError::TaggedData {
+                status: StatusCode::CONFLICT,
+                tag: "PermissionSavedConflictError",
+                fields: json!({
+                    "id": id, "action": a, "resource": r,
+                    "message": format!("A saved permission for {a} {r} already exists"),
+                }),
+            })
+        }
+    }
 }
 
 /// POST /api/experimental/generate/text — `{prompt, model?}` → `{data:{text}}`.
@@ -5676,16 +7018,6 @@ pub async fn generate_text_api(
 // schedules (2.2.5 `experimental.schedule.*`, probed live)
 // ---------------------------------------------------------------------------
 
-/// Upstream gates the whole family on `experimental.schedules` in config and
-/// answers this exact envelope when it is off (probed live).
-fn schedules_disabled() -> crate::HttpError {
-    crate::HttpError::TaggedData {
-        status: StatusCode::FORBIDDEN,
-        tag: "ForbiddenError",
-        fields: json!({"message": "Scheduled tasks are disabled; set experimental.schedules in config"}),
-    }
-}
-
 /// The schedule statuses upstream reports.
 fn schedule_info(row: &serde_json::Value) -> Value {
     let mut out = json!({
@@ -5705,62 +7037,16 @@ fn schedule_info(row: &serde_json::Value) -> Value {
         ("next_due_ms", "nextDueAt"),
         ("ends_at_ms", "endsAt"),
         ("remaining_runs", "remainingRuns"),
+        ("last_fired_at", "lastFiredAt"),
+        ("last_outcome", "lastOutcome"),
     ] {
         let v = &row[src];
-        if !v.is_null() {
+        // `name` is optional upstream: an empty string is omitted, not `""`.
+        if !v.is_null() && !(dst == "name" && v.as_str() == Some("")) {
             m.insert(dst.to_string(), v.clone());
         }
     }
     out
-}
-
-/// Parsed `when` spec plus the first due time. Upstream accepts `in`, `at`,
-/// `every` and `cron`; we cannot compute a full cron calendar without a cron
-/// library, so a cron schedule is accepted and stored with NO due time and a
-/// named divergence (D-SCHEDULE-CRON) rather than guessed at.
-fn schedule_when(when: &Value, now_ms: i64) -> Result<(Value, Option<i64>), crate::HttpError> {
-    let kind = when.get("type").and_then(|v| v.as_str()).unwrap_or("");
-    let num = |k: &str| when.get(k).and_then(|v| v.as_i64());
-    let due = match kind {
-        "in" => num_duration_ms(when.get("in")),
-        "at" => when
-            .get("at")
-            .and_then(|v| v.as_str())
-            .and_then(parse_rfc3339_ms),
-        "every" => num_duration_ms(when.get("every")),
-        "cron" => None,
-        _ => {
-            return Err(crate::HttpError::TaggedData {
-                status: StatusCode::BAD_REQUEST,
-                tag: "InvalidRequestError",
-                fields: json!({
-                    "message": "Missing key\n  at [\"when\"][\"in\"]\nMissing key\n  at [\"when\"][\"at\"]\nMissing key\n  at [\"when\"][\"every\"]\nMissing key\n  at [\"when\"][\"cron\"]",
-                    "kind": "Payload"
-                }),
-            });
-        }
-    };
-    let _ = num;
-    Ok((
-        when.clone(),
-        due.map(|d| if kind == "at" { d } else { now_ms + d }),
-    ))
-}
-
-/// `"90 seconds"` / `"5 minutes"` / `"2 hours"` → milliseconds.
-fn num_duration_ms(v: Option<&Value>) -> Option<i64> {
-    let s = v?.as_str()?;
-    let mut it = s.split_whitespace();
-    let n: i64 = it.next()?.parse().ok()?;
-    let unit = it.next()?.trim_end_matches('s').to_ascii_lowercase();
-    let per = match unit.as_str() {
-        "second" | "sec" | "" => 1_000,
-        "minute" | "min" => 60_000,
-        "hour" | "hr" => 3_600_000,
-        "day" => 86_400_000,
-        _ => return None,
-    };
-    Some(n.saturating_mul(per))
 }
 
 /// Minimal RFC3339 → epoch ms (`2026-11-05T03:00:00Z`), UTC only.
@@ -5792,7 +7078,7 @@ fn parse_rfc3339_ms(s: &str) -> Option<i64> {
 
 /// Map upstream's config knob: `experimental.schedules` truthy enables the
 /// family. Off (the default) → `ForbiddenError`, matching the live 2.2.5.
-fn schedules_enabled(st: &AppState) -> bool {
+pub(crate) fn schedules_enabled(st: &AppState) -> bool {
     st.payloads
         .read()
         .config
@@ -5801,21 +7087,312 @@ fn schedules_enabled(st: &AppState) -> bool {
         .unwrap_or(false)
 }
 
-/// POST /api/experimental/schedule — `{sessionID, prompt, when, …}` → `{data}`.
+/// Upstream's default timezone when neither the `when.tz` nor the config sets
+/// one: the server's local zone. Freeze reports an IANA name (probed:
+/// "Europe/Dublin" on this box); we take `TZ` or fall back to a fixed label
+/// rather than invent a zone we cannot name.
+fn default_tz() -> String {
+    if let Ok(t) = std::env::var("TZ")
+        && !t.is_empty()
+    {
+        return t;
+    }
+    // /etc/localtime is a symlink into the zoneinfo database on every Linux
+    // distro; the basename of its target is the IANA name the reference
+    // reports (probed 2.2.5: "Europe/Dublin" on this box).
+    if let Ok(link) = std::fs::read_link("/etc/localtime")
+        && let Some(name) = link
+            .to_str()
+            .and_then(|p| p.split("zoneinfo/").nth(1))
+            .filter(|n| !n.is_empty())
+    {
+        return name.to_string();
+    }
+    if let Ok(s) = std::fs::read_to_string("/etc/timezone") {
+        let t = s.trim();
+        if !t.is_empty() {
+            return t.to_string();
+        }
+    }
+    "UTC".to_string()
+}
+
+fn schedules_disabled() -> crate::HttpError {
+    crate::HttpError::TaggedData {
+        status: StatusCode::FORBIDDEN,
+        tag: "ForbiddenError",
+        fields: json!({"message": "Scheduled tasks are disabled; set experimental.schedules in config"}),
+    }
+}
+
+/// `Expected a string starting with "ses"` — the shape the reference emits
+/// when a session id fails its brand (probed 2.2.5, `kind:"Query"` under a
+/// query parameter and `"Payload"` in a body).
+fn schedule_bad_session(_id: &str, kind: &str) -> crate::HttpError {
+    // Upstream's message names the FIELD, never the value.
+    crate::HttpError::TaggedData {
+        status: StatusCode::BAD_REQUEST,
+        tag: "InvalidRequestError",
+        fields: json!({
+            "message": "Expected a string starting with \"ses\"\n  at [\"sessionID\"]",
+            "kind": kind,
+        }),
+    }
+}
+
+/// `Expected a string starting with "sch_"` for a malformed path id. Upstream
+/// decodes the PATH before looking anything up, so a bad id is a 400 even when
+/// the feature flag is off (probed).
+fn schedule_bad_id(_id: &str) -> crate::HttpError {
+    // Upstream's message names the FIELD, never the value.
+    crate::HttpError::TaggedData {
+        status: StatusCode::BAD_REQUEST,
+        tag: "InvalidRequestError",
+        fields: json!({
+            "message": "Expected a string starting with \"sch_\"\n  at [\"scheduleID\"]",
+            "kind": "Params",
+        }),
+    }
+}
+
+fn schedule_id_ok(id: &str) -> bool {
+    // Probed 2.2.5: the brand is the PREFIX only — `sch_nope` decodes and 404s
+    // as not-found; only an id without `sch_` is the 400 decode error.
+    id.starts_with("sch_")
+}
+
+/// `InvalidRequestError` with upstream's `kind:"schedule"` for semantic
+/// errors of the schedule service itself (a bad duration, a missing `when`).
+fn schedule_invalid(msg: &str) -> crate::HttpError {
+    crate::HttpError::TaggedData {
+        status: StatusCode::BAD_REQUEST,
+        tag: "InvalidRequestError",
+        fields: json!({"message": msg.to_string(), "kind": "schedule"}),
+    }
+}
+
+/// Parse a duration the way upstream's `Duration` decoder does: a number and
+/// a unit, in either order and either plural form ("2 hours", "90 seconds",
+/// "1h30m" is NOT accepted). Returns milliseconds.
+pub(crate) fn parse_duration_ms(s: &str) -> Option<i64> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    // Bare number => seconds ("in": 10 is written "10 seconds" by the SDK, but
+    // upstream also accepts a plain count of seconds in some call sites).
+    let mut total: i64 = 0;
+    let mut rest = t;
+    let mut any = false;
+    while !rest.trim().is_empty() {
+        rest = rest.trim_start();
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            return None;
+        }
+        rest = &rest[digits.len()..];
+        rest = rest.trim_start();
+        let unit: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphabetic())
+            .collect();
+        if unit.is_empty() {
+            // A bare number means seconds.
+            total = total.saturating_add(digits.parse::<i64>().ok()?.saturating_mul(1_000));
+            any = true;
+            rest = rest.trim_start();
+            continue;
+        }
+        rest = &rest[unit.len()..];
+        let per: i64 = match unit.to_ascii_lowercase().trim_end_matches('s') {
+            "ms" | "millisecond" => 1,
+            "second" | "sec" => 1_000,
+            "minute" | "min" => 60_000,
+            "hour" | "hr" => 3_600_000,
+            "day" => 86_400_000,
+            "week" => 604_800_000,
+            _ => return None,
+        };
+        total = total.saturating_add(digits.parse::<i64>().ok()?.saturating_mul(per));
+        any = true;
+    }
+    any.then_some(total)
+}
+
+/// The five-field cron subset upstream accepts: `minute hour day-of-month
+/// month day-of-week`, each `*`, `*/n`, or a literal. Returns the next due
+/// time in UTC ms. Upstream uses a full cron library; anything outside this
+/// subset returns `None` and the schedule stores no due time, which is the
+/// named divergence `D-SCHEDULE-CRON` (a wrong due time is worse than none).
+pub(crate) fn next_cron_ms(expr: &str, now_ms: i64) -> Option<i64> {
+    let f: Vec<&str> = expr.split_whitespace().collect();
+    if f.len() != 5 {
+        return None;
+    }
+    // (lo, hi) per field.
+    let bounds = [(0i64, 59i64), (0, 23), (1, 31), (1, 12), (0, 7)];
+    let mut fixed = [None::<i64>; 5];
+    let mut step = [1i64; 5];
+    for i in 0..5 {
+        let (lo, hi) = bounds[i];
+        if let Some(n) = f[i].strip_prefix("*/") {
+            step[i] = n
+                .parse()
+                .ok()
+                .filter(|n: &i64| *n > 0 && *n <= hi - lo + 1)?;
+        } else if f[i] == "*" {
+            // any value
+        } else {
+            fixed[i] = Some(f[i].parse().ok().filter(|n: &i64| *n >= lo && *n <= hi)?);
+        }
+    }
+    // 0 and 7 both mean Sunday.
+    if fixed[4] == Some(7) {
+        fixed[4] = Some(0);
+    }
+    // Start at the next whole minute (strictly after now).
+    let start = now_ms / 60_000 + 1;
+    // Two years of minutes is a generous cap for a valid cron expression.
+    for m in start..start + 60 * 24 * 366 * 2 {
+        let minute = m % 60;
+        let hour = (m / 60) % 24;
+        let days = m.div_euclid(1440);
+        let (day, month, _year) = civil_from_days(days);
+        // 1970-01-01 was a Thursday; `rem_euclid` keeps pre-epoch days sane.
+        let dow = (days + 4).rem_euclid(7);
+        let hit =
+            |i: usize, v: i64| fixed[i].is_none_or(|x| x == v) && (v - bounds[i].0) % step[i] == 0;
+        if hit(0, minute) && hit(1, hour) && hit(2, day) && hit(3, month) && hit(4, dow) {
+            return Some(m * 60_000);
+        }
+    }
+    None
+}
+
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (d, m, if m <= 2 { y + 1 } else { y })
+}
+
+/// Normalise the UNTAGGED `when` input into the tagged `Schedule.When` the
+/// reference stores. Upstream's `toWhen` picks by key presence, not by a
+/// `type` field (probed 2.2.5: a payload with `{"in": "10 minutes"}` and no
+/// `type` is accepted; requiring `type` rejected every valid client).
+fn schedule_when(
+    when: Option<&Value>,
+    tz_default: &str,
+) -> Result<(Value, Option<i64>), crate::HttpError> {
+    let Some(when) = when else {
+        // Upstream: "when is required unless until is set".
+        return Err(schedule_invalid("when is required unless until is set"));
+    };
+    if !when.is_object() {
+        return Err(schedule_invalid("Expected Schedule.WhenInput"));
+    }
+    // Upstream echoes `when.tz` ONLY when the caller set it; the resolved
+    // timezone lives in the top-level `tz` (probed 2.2.5).
+    // Only a CALLER-supplied `when.tz` is echoed back (probed 2.2.5: a
+    // payload without it comes back without it, while the resolved zone lives
+    // in the top-level `tz`). `tz_default` is used by the caller for that.
+    let _ = tz_default;
+    let caller_tz = when.get("tz").and_then(|v| v.as_str()).map(str::to_string);
+    let tagged_tz = |base: &Value| -> Value {
+        let mut o = base.clone();
+        if let (Some(t), Some(m)) = (&caller_tz, o.as_object_mut()) {
+            m.insert("tz".to_string(), json!(t));
+        }
+        o
+    };
+    let (tagged, due) = if let Some(v) = when.get("in").and_then(|v| v.as_str()) {
+        let ms = parse_duration_ms(v)
+            .ok_or_else(|| schedule_invalid(&format!("Invalid duration: {v}")))?;
+        (
+            tagged_tz(&json!({"type": "in", "in": v})),
+            Some(now_ms_http() + ms),
+        )
+    } else if let Some(v) = when.get("at").and_then(|v| v.as_str()) {
+        let ms = parse_rfc3339_ms(v)
+            .ok_or_else(|| schedule_invalid(&format!("Invalid instant: {v}")))?;
+        (tagged_tz(&json!({"type": "at", "at": v})), Some(ms))
+    } else if let Some(v) = when.get("every").and_then(|v| v.as_str()) {
+        let ms = parse_duration_ms(v)
+            .ok_or_else(|| schedule_invalid(&format!("Invalid duration: {v}")))?;
+        (
+            tagged_tz(&json!({"type": "every", "every": v})),
+            Some(now_ms_http() + ms),
+        )
+    } else if let Some(v) = when.get("cron").and_then(|v| v.as_str()) {
+        let due = next_cron_ms(v, now_ms_http());
+        (tagged_tz(&json!({"type": "cron", "cron": v})), due)
+    } else {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": "Expected Schedule.WhenInput", "kind": "Payload"}),
+        });
+    };
+    Ok((tagged, due))
+}
+
+/// Validate a `ConditionInput` the way upstream's `toCondition` does, and
+/// return the stored tagged form.
+fn schedule_condition(v: &Value) -> Result<Value, crate::HttpError> {
+    if let Some(code) = v.get("code").and_then(|v| v.as_str()) {
+        if code.is_empty() {
+            return Err(crate::HttpError::TaggedData {
+                status: StatusCode::BAD_REQUEST,
+                tag: "InvalidRequestError",
+                fields: json!({"message": "Expected a non-empty string\n  at [\"code\"]", "kind": "Payload"}),
+            });
+        }
+        return Ok(json!({"type": "code", "code": code}));
+    }
+    let Some(run) = v.get("run").and_then(|v| v.as_str()) else {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": "Missing key\n  at [\"run\"]", "kind": "Payload"}),
+        });
+    };
+    let mut out = json!({"type": "shell", "run": run});
+    for k in ["is", "matches"] {
+        if let Some(x) = v.get(k).and_then(|x| x.as_str()) {
+            out[k] = json!(x);
+        }
+    }
+    if let Some(x) = v.get("changes").and_then(|x| x.as_bool()) {
+        out["changes"] = json!(x);
+    }
+    Ok(out)
+}
+
+/// POST /api/experimental/schedule — `{sessionID, prompt, when?, …}` → `{data}`.
 pub async fn schedule_create(
     State(st): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, crate::HttpError> {
-    if !schedules_enabled(&st) {
-        return Err(schedules_disabled());
-    }
-    let Some(session_id) = body.get("sessionID").and_then(|v| v.as_str()) else {
+    // Ordering probed 2.2.5: decode the body (400 Payload), decode+lookup the
+    // session (400 / 404), THEN the feature gate (403). The previous handler
+    // gated first, so every malformed payload answered 403 instead of the
+    // decode error the client uses to fix its request.
+    let Some(sid) = body.get("sessionID").and_then(|v| v.as_str()) else {
         return Err(crate::HttpError::TaggedData {
             status: StatusCode::BAD_REQUEST,
             tag: "InvalidRequestError",
             fields: json!({"message": "Missing key\n  at [\"sessionID\"]", "kind": "Payload"}),
         });
     };
+    if !sid.starts_with("ses") {
+        return Err(schedule_bad_session(sid, "Payload"));
+    }
     let Some(prompt) = body.get("prompt").and_then(|v| v.as_str()) else {
         return Err(crate::HttpError::TaggedData {
             status: StatusCode::BAD_REQUEST,
@@ -5823,18 +7400,85 @@ pub async fn schedule_create(
             fields: json!({"message": "Missing key\n  at [\"prompt\"]", "kind": "Payload"}),
         });
     };
-    let when = body.get("when").cloned().unwrap_or(Value::Null);
+    if prompt.is_empty() {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": "Expected a non-empty string\n  at [\"prompt\"]", "kind": "Payload"}),
+        });
+    }
+    if !ocserve_store::session_exists(&st.db, sid).unwrap_or(false) {
+        return Err(session_not_found(sid));
+    }
+    if !schedules_enabled(&st) {
+        return Err(schedules_disabled());
+    }
+    if body.get("if").is_some() && body.get("until").is_some() {
+        return Err(schedule_invalid("Choose either if or until, not both"));
+    }
+    // Payload decode happens BEFORE service validation upstream, so a bad
+    // `ends.after` wins over a bad `when.in` when both are wrong (probed).
+    let tz_default = default_tz();
+    let (ends_at_ms, remaining_runs, ends_json) = match body.get("ends") {
+        Some(e) if e.is_object() => {
+            let mut ends_at = None;
+            let mut remaining = None;
+            // A PRESENT but non-string `after` is a decode error upstream
+            // (`Expected Schedule.Duration`), not "absent": skipping it
+            // silently accepted `{"after": 3}` (probed 2.2.5).
+            if let Some(a) = e.get("after") {
+                let s = a.as_str().ok_or_else(|| crate::HttpError::TaggedData {
+                    status: StatusCode::BAD_REQUEST,
+                    tag: "InvalidRequestError",
+                    fields: json!({"message": "Expected Schedule.Duration\n  at [\"ends\"][\"after\"]", "kind": "Payload"}),
+                })?;
+                let ms = parse_duration_ms(s)
+                    .ok_or_else(|| crate::HttpError::TaggedData {
+                        status: StatusCode::BAD_REQUEST,
+                        tag: "InvalidRequestError",
+                        fields: json!({"message": "Expected Schedule.Duration\n  at [\"ends\"][\"after\"]", "kind": "Payload"}),
+                    })?;
+                ends_at = Some(now_ms_http() + ms);
+            }
+            if let Some(t) = e.get("times").and_then(|v| v.as_i64()) {
+                if t <= 0 {
+                    return Err(crate::HttpError::TaggedData {
+                        status: StatusCode::BAD_REQUEST,
+                        tag: "InvalidRequestError",
+                        fields: json!({"message": "Expected a positive integer\n  at [\"ends\"][\"times\"]", "kind": "Payload"}),
+                    });
+                }
+                remaining = Some(t);
+            }
+            (ends_at, remaining, Some(e.clone()))
+        }
+        _ => (None, None, None),
+    };
+    let (when_json, next_due) = schedule_when(body.get("when"), &tz_default)?;
+    let condition_json = match body.get("if") {
+        Some(v) => Some(schedule_condition(v)?),
+        None => match body.get("until") {
+            Some(v) => Some(schedule_condition(v)?),
+            None => None,
+        },
+    };
     let now = now_ms_http();
-    let (when_json, next_due) = schedule_when(&when, now)?;
     let id = format!("sch_{:013x}{:010x}", now, std::process::id());
     let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("");
-    let tz = when.get("tz").and_then(|v| v.as_str()).unwrap_or("");
+    let tz = when_json
+        .get("tz")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&tz_default)
+        .to_string();
     let row = json!({
-        "id": id, "session_id": session_id, "name": name, "prompt": prompt,
+        "id": id, "session_id": sid, "name": name, "prompt": prompt,
         "when_json": when_json, "tz": tz,
-        "condition_json": body.get("if").cloned().unwrap_or(Value::Null),
-        "next_due_ms": next_due, "run_count": 0,
-        "status": "active", "time_created": now, "time_updated": now,
+        "condition_json": condition_json,
+        "ends_json": ends_json,
+        "next_due_ms": next_due, "ends_at_ms": ends_at_ms,
+        "remaining_runs": remaining_runs,
+        "run_count": 0, "status": "active",
+        "time_created": now, "time_updated": now,
     });
     store_schedule(&st, &row).await?;
     Ok(Json(json!({"data": schedule_info(&row)})))
@@ -5845,9 +7489,6 @@ pub async fn schedule_list(
     State(st): State<Arc<AppState>>,
     Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Value>, crate::HttpError> {
-    if !schedules_enabled(&st) {
-        return Err(schedules_disabled());
-    }
     let Some(sid) = q.get("sessionID") else {
         return Err(crate::HttpError::TaggedData {
             status: StatusCode::BAD_REQUEST,
@@ -5855,10 +7496,93 @@ pub async fn schedule_list(
             fields: json!({"message": "Missing key\n  at [\"sessionID\"]", "kind": "Query"}),
         });
     };
+    if !sid.starts_with("ses") {
+        return Err(schedule_bad_session(sid, "Query"));
+    }
+    if !ocserve_store::session_exists(&st.db, sid).unwrap_or(false) {
+        return Err(session_not_found(sid));
+    }
+    if !schedules_enabled(&st) {
+        return Err(schedules_disabled());
+    }
     let rows = read_schedules(&st, Some(sid)).unwrap_or_default();
     Ok(Json(
         json!({"data": rows.iter().map(schedule_info).collect::<Vec<_>>()}),
     ))
+}
+
+/// Rows that are due now and past their retry back-off, oldest due first.
+pub(crate) fn schedules_due(st: &AppState, now: i64) -> anyhow::Result<Vec<Value>> {
+    let r = ocserve_store::pragma::open_reader(&st.db)?;
+    let sql = format!(
+        "SELECT {SCHEDULE_COLS} FROM schedule \
+          WHERE status = 'active' AND next_due_ms IS NOT NULL AND next_due_ms <= ?1 \
+            AND (retry_at IS NULL OR retry_at <= ?1) \
+          ORDER BY next_due_ms"
+    );
+    let mut stmt = r.prepare_cached(&sql)?;
+    let rows = stmt
+        .query_map([now], schedule_row)?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
+/// Milliseconds until the next future slot, or `None` when none is scheduled.
+pub(crate) fn schedules_next_wake(st: &AppState, now: i64) -> anyhow::Result<Option<i64>> {
+    let r = ocserve_store::pragma::open_reader(&st.db)?;
+    let at: Option<i64> = r.query_row(
+        "SELECT min(next_due_ms) FROM schedule \
+          WHERE status = 'active' AND next_due_ms IS NOT NULL AND next_due_ms > ?1",
+        [now],
+        |row| row.get(0),
+    )?;
+    Ok(at)
+}
+
+/// Apply one state transition. Only a still-ACTIVE row is updated, so a pause
+/// that lands during a firing wins (upstream's `update` has the same guard).
+pub(crate) fn schedule_mark(st: &AppState, id: &str, fields: Value) -> anyhow::Result<()> {
+    let obj = fields.as_object().cloned().unwrap_or_default();
+    let mut sets: Vec<String> = Vec::new();
+    let mut params: Vec<Value> = Vec::new();
+    for (col, val) in obj {
+        // Column names come from our own call sites, never from a request.
+        match col.as_str() {
+            "status" | "last_outcome" | "last_message_id" | "next_due_ms" | "remaining_runs"
+            | "run_count" | "last_fired_at" | "retry_at" | "checks" | "failures"
+            | "time_updated" => {}
+            other => anyhow::bail!("schedule_mark: unknown column {other}"),
+        }
+        params.push(val);
+        sets.push(format!("{col} = ?{}", params.len()));
+    }
+    if sets.is_empty() {
+        return Ok(());
+    }
+    let sql = format!(
+        "UPDATE schedule SET {} WHERE id = ?{} AND status = 'active'",
+        sets.join(", "),
+        params.len() + 1
+    );
+    params.push(json!(id));
+    st.writer
+        .write(vec![ocserve_store::writer::WriteOp::Sql { sql, params }])?;
+    Ok(())
+}
+
+fn find_schedule(st: &AppState, id: &str) -> Result<Option<Value>, crate::HttpError> {
+    // A schedule whose session vanished reads as missing, like upstream's
+    // `find` (which maps SessionNotFound to ScheduleNotFound).
+    Ok(read_schedules(st, None)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|r| {
+            r["id"].as_str() == Some(id)
+                && r["session_id"]
+                    .as_str()
+                    .is_some_and(|s| s.starts_with("ses"))
+        }))
 }
 
 /// GET /api/experimental/schedule/{scheduleID} → `{data}`.
@@ -5866,17 +7590,20 @@ pub async fn schedule_get(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, crate::HttpError> {
+    if !schedule_id_ok(&id) {
+        return Err(schedule_bad_id(&id));
+    }
+    let Some(row) = find_schedule(&st, &id)? else {
+        return Err(schedule_not_found(&id));
+    };
+    let sid = row["session_id"].as_str().unwrap_or("");
+    if !ocserve_store::session_exists(&st.db, sid).unwrap_or(false) {
+        return Err(schedule_not_found(&id));
+    }
     if !schedules_enabled(&st) {
         return Err(schedules_disabled());
     }
-    let row = read_schedules(&st, None)
-        .unwrap_or_default()
-        .into_iter()
-        .find(|r| r["id"].as_str() == Some(id.as_str()));
-    match row {
-        Some(r) => Ok(Json(json!({"data": schedule_info(&r)}))),
-        None => Err(schedule_not_found(&id)),
-    }
+    Ok(Json(json!({"data": schedule_info(&row)})))
 }
 
 fn schedule_not_found(id: &str) -> crate::HttpError {
@@ -5892,7 +7619,7 @@ pub async fn schedule_pause(
     st: State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<axum::response::Response, crate::HttpError> {
-    schedule_transition(st, Path(id), ScheduleAction::Pause).await
+    schedule_transition(st, id, ScheduleAction::Pause).await
 }
 
 /// POST /api/experimental/schedule/{scheduleID}/resume
@@ -5900,7 +7627,7 @@ pub async fn schedule_resume(
     st: State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<axum::response::Response, crate::HttpError> {
-    schedule_transition(st, Path(id), ScheduleAction::Resume).await
+    schedule_transition(st, id, ScheduleAction::Resume).await
 }
 
 /// DELETE /api/experimental/schedule/{scheduleID}
@@ -5908,25 +7635,29 @@ pub async fn schedule_delete(
     st: State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<axum::response::Response, crate::HttpError> {
-    schedule_transition(st, Path(id), ScheduleAction::Delete).await
+    schedule_transition(st, id, ScheduleAction::Delete).await
 }
 
 /// POST pause | resume | DELETE — the three transitions upstream exposes.
+/// Ordering probed: path decode (400) → existence (404) → feature gate (403).
 async fn schedule_transition(
     State(st): State<Arc<AppState>>,
-    Path(id): Path<String>,
+    id: String,
     action: ScheduleAction,
 ) -> Result<axum::response::Response, crate::HttpError> {
+    if !schedule_id_ok(&id) {
+        return Err(schedule_bad_id(&id));
+    }
+    let Some(mut row) = find_schedule(&st, &id)? else {
+        return Err(schedule_not_found(&id));
+    };
+    let sid = row["session_id"].as_str().unwrap_or("");
+    if !ocserve_store::session_exists(&st.db, sid).unwrap_or(false) {
+        return Err(schedule_not_found(&id));
+    }
     if !schedules_enabled(&st) {
         return Err(schedules_disabled());
     }
-    let exists = read_schedules(&st, None)
-        .unwrap_or_default()
-        .into_iter()
-        .find(|r| r["id"].as_str() == Some(id.as_str()));
-    let Some(mut row) = exists else {
-        return Err(schedule_not_found(&id));
-    };
     match action {
         ScheduleAction::Pause => {
             row["status"] = json!("paused");
@@ -5955,40 +7686,54 @@ pub enum ScheduleAction {
     Delete,
 }
 
+const SCHEDULE_COLS: &str = "id, session_id, name, prompt, when_json, tz, condition_json, ends_json, status, \
+         next_due_ms, ends_at_ms, remaining_runs, run_count, last_message_id, \
+         last_fired_at, last_outcome, time_created, time_updated";
+
+/// Shared column → stored-row mapper (read path and runner). Column order is
+/// fixed by the two SELECTs below; `last_message_id` is appended last.
+fn schedule_row(x: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
+    Ok(json!({
+        "id": x.get::<_, String>(0)?,
+        "session_id": x.get::<_, String>(1)?,
+        "name": x.get::<_, String>(2)?,
+        "prompt": x.get::<_, String>(3)?,
+        "when_json": serde_json::from_str::<Value>(&x.get::<_, String>(4)?).unwrap_or(Value::Null),
+        "tz": x.get::<_, String>(5)?,
+        "condition_json": x.get::<_, Option<String>>(6)?
+            .map(|s| serde_json::from_str::<Value>(&s).unwrap_or(Value::Null)),
+        "ends_json": x.get::<_, Option<String>>(7)?
+            .map(|s| serde_json::from_str::<Value>(&s).unwrap_or(Value::Null)),
+        "status": x.get::<_, String>(8)?,
+        "next_due_ms": x.get::<_, Option<i64>>(9)?,
+        "ends_at_ms": x.get::<_, Option<i64>>(10)?,
+        "remaining_runs": x.get::<_, Option<i64>>(11)?,
+        "run_count": x.get::<_, i64>(12)?,
+        "last_message_id": x.get::<_, Option<String>>(13)?,
+        "last_fired_at": x.get::<_, Option<i64>>(14)?,
+        "last_outcome": x.get::<_, Option<String>>(15)?,
+        "time_created": x.get::<_, i64>(16)?,
+        "time_updated": x.get::<_, i64>(17)?,
+    }))
+}
+
 fn read_schedules(st: &AppState, session: Option<&String>) -> anyhow::Result<Vec<Value>> {
     let r = ocserve_store::pragma::open_reader(&st.db)?;
     let sql = if session.is_some() {
-        "SELECT id, session_id, name, prompt, when_json, tz, condition_json, ends_json, status, \
-                next_due_ms, ends_at_ms, remaining_runs, run_count, time_created, time_updated \
-           FROM schedule WHERE session_id = ?1 ORDER BY time_created"
+        format!("SELECT {SCHEDULE_COLS} FROM schedule WHERE session_id = ?1 ORDER BY time_created")
     } else {
-        "SELECT id, session_id, name, prompt, when_json, tz, condition_json, ends_json, status, \
-                next_due_ms, ends_at_ms, remaining_runs, run_count, time_created, time_updated \
-           FROM schedule ORDER BY time_created"
+        format!("SELECT {SCHEDULE_COLS} FROM schedule ORDER BY time_created")
     };
-    let mut stmt = r.prepare(sql)?;
-    let map = |x: &rusqlite::Row<'_>| -> rusqlite::Result<Value> {
-        Ok(json!({
-            "id": x.get::<_, String>(0)?,
-            "session_id": x.get::<_, String>(1)?,
-            "name": x.get::<_, String>(2)?,
-            "prompt": x.get::<_, String>(3)?,
-            "when_json": serde_json::from_str::<Value>(&x.get::<_, String>(4)?).unwrap_or(Value::Null),
-            "tz": x.get::<_, String>(5)?,
-            "condition_json": x.get::<_, Option<String>>(6)?.map(|s| serde_json::from_str::<Value>(&s).unwrap_or(Value::Null)),
-            "ends_json": x.get::<_, Option<String>>(7)?.map(|s| serde_json::from_str::<Value>(&s).unwrap_or(Value::Null)),
-            "status": x.get::<_, String>(8)?,
-            "next_due_ms": x.get::<_, Option<i64>>(9)?,
-            "ends_at_ms": x.get::<_, Option<i64>>(10)?,
-            "remaining_runs": x.get::<_, Option<i64>>(11)?,
-            "run_count": x.get::<_, i64>(12)?,
-            "time_created": x.get::<_, i64>(13)?,
-            "time_updated": x.get::<_, i64>(14)?,
-        }))
-    };
+    let mut stmt = r.prepare(&sql)?;
     let rows: Vec<Value> = match session {
-        Some(sid) => stmt.query_map([sid], map)?.filter_map(|r| r.ok()).collect(),
-        None => stmt.query_map([], map)?.filter_map(|r| r.ok()).collect(),
+        Some(sid) => stmt
+            .query_map([sid], schedule_row)?
+            .filter_map(|r| r.ok())
+            .collect(),
+        None => stmt
+            .query_map([], schedule_row)?
+            .filter_map(|r| r.ok())
+            .collect(),
     };
     Ok(rows)
 }
@@ -6251,19 +7996,48 @@ pub async fn voice_session_api(Json(body): Json<Value>) -> Result<Json<Value>, H
             fields: json!({"message": "Expected string\n  at [\"model\"]", "kind": "Payload"}),
         });
     }
-    if body.get("transport").is_none() {
+    // `transport` is the discriminated `VoiceTransportInput` union
+    // (`{type:"webrtc",sdp}` | `{type:"websocket"}`), not a bare string:
+    // probed, `{"transport":"webrtc"}` is `Expected VoiceTransportInput`.
+    let Some(t) = body.get("transport") else {
         return Err(crate::HttpError::TaggedData {
             status: StatusCode::BAD_REQUEST,
             tag: "InvalidRequestError",
             fields: json!({"message": "Missing key\n  at [\"transport\"]", "kind": "Payload"}),
         });
+    };
+    let kind = t.get("type").and_then(|v| v.as_str());
+    let valid = match kind {
+        Some("webrtc") => t.get("sdp").and_then(|v| v.as_str()).is_some(),
+        Some("websocket") => true,
+        _ => false,
+    };
+    if !valid {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": "Expected VoiceTransportInput\n  at [\"transport\"]", "kind": "Payload"}),
+        });
     }
+    // The reference only knows these two models and rejects anything else with
+    // a plain 400 before reaching the provider.
+    let model = body["model"].as_str().unwrap_or_default();
+    if !model.starts_with("gpt-live-") && !model.starts_with("gpt-realtime-") {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": format!("Unsupported voice model: {model}")}),
+        });
+    }
+    // With a supported model the reference asks the provider for a session and
+    // fails when no OpenAI credential exists. We have no audio transport at
+    // all, so our refusal is the same class and wording (D-VOICE-TRANSPORT).
     Err(crate::HttpError::TaggedData {
         status: StatusCode::SERVICE_UNAVAILABLE,
         tag: "ServiceUnavailableError",
         fields: json!({
-            "message": "voice sessions are not available on this server",
-            "service": "experimental.voice"
+            "message": "GPT-Live needs an OpenAI API key (a stored key or OPENAI_API_KEY) or an OpenCode Console connection on the server. ChatGPT sign-in can't start voice sessions.",
+            "service": "openai"
         }),
     })
 }
@@ -6287,7 +8061,12 @@ pub async fn client_mcp_get(
             fields: json!({"message": "Missing key\n  at [\"name\"]", "kind": "Query"}),
         });
     }
-    Err(client_mcp_refused())
+    // Probed: with a name present the reference upgrades the request to a
+    // WebSocket and a plain HTTP GET gets a bare 400 with an EMPTY body, not
+    // the tagged envelope (the token route is where the tagged refusal lives).
+    Err(crate::HttpError::EmptyBody {
+        status: StatusCode::BAD_REQUEST,
+    })
 }
 
 /// POST /api/experimental/client-mcp/token?name= — same story: minting a
@@ -6312,5 +8091,34 @@ fn client_mcp_refused() -> crate::HttpError {
         status: StatusCode::FORBIDDEN,
         tag: "ForbiddenError",
         fields: json!({"message": "Invalid client MCP connect token request"}),
+    }
+}
+
+#[cfg(test)]
+mod workspace_adapter_tests {
+    use super::workspace_adapter_refusal;
+
+    /// Probed 1.19.5: `local` and `directory` are NOT aliases for `worktree`.
+    /// This handler used to accept them and mint a `wrk_` id for anything.
+    #[test]
+    fn only_worktree_is_known() {
+        for bad in ["local", "directory", "bogus", ""] {
+            assert_eq!(
+                workspace_adapter_refusal(bad, true).as_deref(),
+                Some(format!("Unknown workspace adapter: {bad}").as_str()),
+                "{bad} must be refused"
+            );
+        }
+        assert_eq!(workspace_adapter_refusal("worktree", true), None);
+    }
+
+    /// A worktree on a non-git project is refused with the reference's own
+    /// wording, not a bare 400 and not a fabricated id.
+    #[test]
+    fn worktree_requires_a_git_project() {
+        assert_eq!(
+            workspace_adapter_refusal("worktree", false).as_deref(),
+            Some("Worktrees are only supported for git projects")
+        );
     }
 }

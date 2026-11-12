@@ -113,11 +113,26 @@ async fn fs_watch_requires_a_path_and_accepts_a_registration() {
     assert_eq!(r.status(), StatusCode::BAD_REQUEST);
     assert_eq!(json(r).await["_tag"], "InvalidRequestError");
 
+    // Probed 2.2.5: the reference resolves the path inside the session location
+    // and 404s anything else — including an existing file outside it. The test
+    // app's location is the repo root, so a nonexistent path must 404.
     let r = req(
         &app(),
         "POST",
         "/api/experimental/fs/watch",
-        Some(serde_json::json!({"path": "src/lib.rs"})),
+        Some(serde_json::json!({"path": "definitely/absent.txt"})),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    let v = json(r).await;
+    assert_eq!(v["_tag"], "FileNotFoundError");
+    assert_eq!(v["path"], "definitely/absent.txt");
+
+    let r = req(
+        &app(),
+        "POST",
+        "/api/experimental/fs/watch",
+        Some(serde_json::json!({"path": "Cargo.toml"})),
     )
     .await;
     assert_eq!(r.status(), StatusCode::NO_CONTENT);
@@ -132,27 +147,76 @@ async fn fs_watch_requires_a_path_and_accepts_a_registration() {
 }
 
 #[tokio::test]
-async fn artifacts_are_refused_exactly_like_the_reference_when_disabled() {
-    // Live: {"_tag":"ForbiddenError","message":"Artifacts are disabled; set
-    // experimental.artifacts in config"} for every route in the family.
-    for (m, p) in [
-        ("GET", "/api/experimental/artifacts"),
-        ("GET", "/api/experimental/artifacts/providers"),
-        ("GET", "/api/experimental/artifacts/art_x"),
-        ("PATCH", "/api/experimental/artifacts/art_x"),
-        ("DELETE", "/api/experimental/artifacts/art_x"),
+async fn artifacts_refuse_only_after_the_request_decodes() {
+    // Probed 2.2.5 ordering: the BODY/path decodes first, then the feature
+    // gate. A malformed id is a 400 and a missing `files` is a payload error
+    // even with the flag off; a well-formed request gets the ForbiddenError.
+    for (m, p, body, want) in [
+        (
+            "GET",
+            "/api/experimental/artifacts",
+            None,
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "GET",
+            "/api/experimental/artifacts/providers",
+            None,
+            StatusCode::FORBIDDEN,
+        ),
+        // no `art_` prefix -> Params decode error BEFORE the gate
+        (
+            "GET",
+            "/api/experimental/artifacts/nope",
+            None,
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "DELETE",
+            "/api/experimental/artifacts/nope",
+            None,
+            StatusCode::BAD_REQUEST,
+        ),
+        // prefixed id decodes; GET/DELETE then hit the gate
+        (
+            "GET",
+            "/api/experimental/artifacts/art_x",
+            None,
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "DELETE",
+            "/api/experimental/artifacts/art_x",
+            None,
+            StatusCode::FORBIDDEN,
+        ),
+        // PATCH decodes its BODY first (probed)
+        (
+            "PATCH",
+            "/api/experimental/artifacts/art_x",
+            Some(serde_json::json!({})),
+            StatusCode::BAD_REQUEST,
+        ),
+        // well-formed body but the gate is off
+        (
+            "POST",
+            "/api/experimental/artifacts",
+            Some(serde_json::json!({"title":"t","files":{"a":"b"}})),
+            StatusCode::FORBIDDEN,
+        ),
     ] {
-        let r = req(&app(), m, p, Some(serde_json::json!({}))).await;
-        assert_eq!(r.status(), StatusCode::FORBIDDEN, "{m} {p}");
-        let v = json(r).await;
-        assert_eq!(v["_tag"], "ForbiddenError", "{m} {p}");
-        assert!(
-            v["message"]
-                .as_str()
-                .unwrap()
-                .contains("experimental.artifacts")
-        );
+        let r = req(&app(), m, p, body).await;
+        assert_eq!(r.status(), want, "{m} {p}");
     }
+    let r = req(&app(), "GET", "/api/experimental/artifacts", None).await;
+    let v = json(r).await;
+    assert_eq!(v["_tag"], "ForbiddenError");
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap()
+            .contains("experimental.artifacts")
+    );
 }
 
 #[tokio::test]
@@ -184,7 +248,13 @@ async fn permission_saved_patch_unknown_id_is_not_found() {
 }
 
 #[tokio::test]
-async fn heap_dump_reports_real_memory_and_no_fake_snapshot() {
+async fn heap_dump_answers_a_contract_valid_200_with_a_real_file() {
+    // The contract requires `path`, `pid` and all five `memory` counters and
+    // forbids additional keys (`additionalProperties:false`). A Rust process
+    // has no V8 heap, so the honest mapping is a real file containing our own
+    // numbers, a truthful `rss`, and zeros for the V8-only counters
+    // (D-HEAP-DUMP). The earlier 500 was a shape no client could decode as a
+    // success, and the file it claimed to write did not exist.
     let r = req(
         &app(),
         "POST",
@@ -195,30 +265,52 @@ async fn heap_dump_reports_real_memory_and_no_fake_snapshot() {
     assert_eq!(r.status(), StatusCode::OK);
     let v = json(r).await;
     assert_eq!(v["pid"], std::process::id());
-    // A Rust process has no V8 heap: the path must be null, never a file we
-    // did not write.
-    assert!(v["path"].is_null());
-    assert!(v.get("unsupported").is_some());
+    assert!(v["memory"]["rss"].as_u64().unwrap() > 0, "rss must be real");
+    for k in ["heapTotal", "heapUsed", "external", "arrayBuffers"] {
+        assert!(v["memory"][k].is_u64(), "{k} must be a number");
+    }
+    let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["memory", "path", "pid"],
+        "no keys outside the contract"
+    );
+    let path = v["path"].as_str().unwrap();
+    assert!(
+        std::path::Path::new(path).is_file(),
+        "the reported path must exist"
+    );
 }
 
 #[tokio::test]
-async fn schedules_are_forbidden_unless_enabled() {
-    // Live: disabled -> ForbiddenError "Scheduled tasks are disabled; set
-    // experimental.schedules in config".
+async fn schedules_decode_before_the_feature_gate() {
+    // Probed 2.2.5 ordering: query/body decode -> session existence -> gate.
+    // A malformed sessionID is a 400 and an unknown one a 404 even with the
+    // flag off; only a well-formed request sees ForbiddenError.
+    let r = req(&app(), "GET", "/api/experimental/schedule", None).await;
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST, "missing sessionID");
+    assert_eq!(json(r).await["kind"], "Query");
+
     let r = req(
         &app(),
         "GET",
-        "/api/experimental/schedule?sessionID=ses_x",
+        "/api/experimental/schedule?sessionID=nope",
         None,
     )
     .await;
-    assert_eq!(r.status(), StatusCode::FORBIDDEN);
-    assert!(
-        json(r).await["message"]
-            .as_str()
-            .unwrap()
-            .contains("experimental.schedules")
-    );
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST, "bad sessionID brand");
+    assert_eq!(json(r).await["kind"], "Query");
+
+    let r = req(
+        &app(),
+        "GET",
+        "/api/experimental/schedule?sessionID=ses_0000000000000000000000000",
+        None,
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::NOT_FOUND, "unknown session");
+
     let r = req(
         &app(),
         "POST",
@@ -226,7 +318,20 @@ async fn schedules_are_forbidden_unless_enabled() {
         Some(serde_json::json!({})),
     )
     .await;
-    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST, "missing body keys");
+
+    // Well-formed but the flag is off.
+    let sid = "ses_sched_disabled_fixture0000";
+    let r = req(
+        &app(),
+        "GET",
+        &format!("/api/experimental/schedule?sessionID={sid}"),
+        None,
+    )
+    .await;
+    // The fixture may not have that session; either way the answer is NOT a
+    // 200, and when it exists it is the ForbiddenError.
+    assert_ne!(r.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -314,46 +419,57 @@ async fn schedule_unknown_id_is_not_found_with_the_reference_shape() {
 }
 
 #[tokio::test]
-async fn schedule_rejects_an_unrecognised_when_spec() {
-    // Live: a `when` with no in/at/every/cron returns all four Missing-key
-    // lines in one message (Effect decode reports every branch).
+async fn schedule_accepts_upstream_untagged_when_and_computes_cron() {
+    // Upstream's input is UNTAGGED (`{"in": "10 minutes"}`, no `type` field —
+    // schedule.ts `toWhen` picks by key presence). Requiring `type` rejected
+    // EVERY valid client payload.
     let a = app_with(serde_json::json!({"experimental": {"schedules": true}}));
     let sid = new_session(&a).await;
-    let r = req(
-        &a,
-        "POST",
-        "/api/experimental/schedule",
-        Some(serde_json::json!({
-            "sessionID": sid, "prompt": "p", "when": {"type": "cron"}
-        })),
-    )
-    .await;
-    // cron is accepted structurally with no computed due time (D-SCHEDULE-CRON)
-    assert_eq!(
-        r.status(),
-        StatusCode::OK,
-        "cron accepted without a due time"
-    );
+    for when in [
+        serde_json::json!({"in": "10 minutes"}),
+        serde_json::json!({"every": "1 hour"}),
+        serde_json::json!({"at": "2030-01-01T00:00:00Z"}),
+        serde_json::json!({"cron": "*/5 * * * *"}),
+    ] {
+        let r = req(
+            &a,
+            "POST",
+            "/api/experimental/schedule",
+            Some(serde_json::json!({"sessionID": sid, "prompt": "p", "when": when})),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK, "when={when}");
+        let v = json(r).await;
+        assert!(v["data"]["nextDueAt"].is_number(), "due time computed: {v}");
+        assert!(
+            v["data"]["when"]["type"].is_string(),
+            "tagged when stored: {v}"
+        );
+    }
+
+    // A spec with none of the four keys is the reference's `Expected
+    // Schedule.WhenInput` payload error.
     let bad = req(
         &a,
         "POST",
         "/api/experimental/schedule",
-        Some(serde_json::json!({
-            "sessionID": sid, "prompt": "p", "when": {"type": "nonsense"}
-        })),
+        Some(serde_json::json!({"sessionID": sid, "prompt": "p", "when": {"nonsense": 1}})),
+    )
+    .await;
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+
+    // A bad duration is the service's `Invalid duration` with kind schedule.
+    let bad = req(
+        &a,
+        "POST",
+        "/api/experimental/schedule",
+        Some(serde_json::json!({"sessionID": sid, "prompt": "p", "when": {"in": "10m"}})),
     )
     .await;
     assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
     let v = json(bad).await;
-    let m = v["message"].as_str().unwrap();
-    for k in [
-        "when\"][\"in",
-        "when\"][\"at",
-        "when\"][\"every",
-        "when\"][\"cron",
-    ] {
-        assert!(m.contains(k), "missing branch {k}: {m}");
-    }
+    assert_eq!(v["kind"], "schedule");
+    assert!(v["message"].as_str().unwrap().contains("Invalid duration"));
 }
 
 #[tokio::test]
@@ -444,6 +560,45 @@ async fn voice_session_validates_shape_then_reports_unavailable() {
             .unwrap()
             .contains("transport")
     );
+    // Probed: `transport` is the discriminated union, so a bare string is the
+    // same `Expected VoiceTransportInput` decode error.
+    let r = req(
+        &app(),
+        "POST",
+        "/api/experimental/voice/session",
+        Some(serde_json::json!({"model": "gpt-live-1", "transport": "webrtc"})),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        json(r).await["message"]
+            .as_str()
+            .unwrap()
+            .contains("Expected VoiceTransportInput")
+    );
+
+    // Probed: the reference rejects a model it does not know with a plain 400
+    // before ever reaching the provider.
+    let r = req(
+        &app(),
+        "POST",
+        "/api/experimental/voice/session",
+        Some(serde_json::json!({
+            "model": "not-a-voice-model",
+            "transport": {"type": "websocket"}
+        })),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        json(r).await["message"]
+            .as_str()
+            .unwrap()
+            .contains("Unsupported voice model")
+    );
+
+    // A supported model + transport reaches the provider and fails on the
+    // missing OpenAI credential: the reference's own message and service tag.
     let r = req(
         &app(),
         "POST",
@@ -452,7 +607,10 @@ async fn voice_session_validates_shape_then_reports_unavailable() {
     )
     .await;
     assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(json(r).await["_tag"], "ServiceUnavailableError");
+    let v = json(r).await;
+    assert_eq!(v["_tag"], "ServiceUnavailableError");
+    assert_eq!(v["service"], "openai");
+    assert!(v["message"].as_str().unwrap().contains("OpenAI API key"));
 }
 
 #[tokio::test]
@@ -462,6 +620,9 @@ async fn client_mcp_requires_name_and_refuses_with_the_reference_envelope() {
     let r = req(&app(), "GET", "/api/experimental/client-mcp", None).await;
     assert_eq!(r.status(), StatusCode::BAD_REQUEST);
     assert_eq!(json(r).await["kind"], "Query");
+    // Probed: with a name present the reference tries a WebSocket upgrade and
+    // answers a BARE 400 (empty body) to a plain GET. The tagged refusal
+    // belongs to the token route only.
     let r = req(
         &app(),
         "GET",
@@ -469,8 +630,8 @@ async fn client_mcp_requires_name_and_refuses_with_the_reference_envelope() {
         None,
     )
     .await;
-    assert_eq!(r.status(), StatusCode::FORBIDDEN);
-    assert_eq!(json(r).await["_tag"], "ForbiddenError");
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    assert!(r.into_body().collect().await.unwrap().to_bytes().is_empty());
     let r = req(
         &app(),
         "POST",

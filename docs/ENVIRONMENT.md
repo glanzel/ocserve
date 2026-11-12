@@ -89,7 +89,7 @@ for the normal behaviour.
 | Variable | Default | Accepted | Meaning |
 |---|---|---|---|
 | `OCSERVE_UI` | on | 0 disables | HTTP UI routes. Disabled returns a JSON 404 instead of the app. |
-| `OCSERVE_UI_PACK` | 1.18.31 | 1.18.31 \| 2.0.28 | Which embedded web-UI build is served. |
+| `OCSERVE_UI_PACK` | v1 | v1 \| v2 \| any 2.x tag | Which embedded web-UI build is served. `v2` (or a 2.x tag) also turns the v2 runtime on unless OCSERVE_V2=0. |
 | `OCSERVE_DISABLE_EMBEDDED_WEB_UI` | off (embedded build served) | 1 disables | Serve through OCSERVE_UI_UPSTREAM instead of the embedded build. |
 | `OCSERVE_UI_UPSTREAM` | https://app.opencode.ai | a URL | Proxy target used only when the embedded UI is disabled. |
 | `OCSERVE_UI_PREWARM` | off | 1 enables | Fetch the entry HTML's assets at boot. |
@@ -134,3 +134,6 @@ upstream does.
 | `OPENCODE_API_KEY` | Key for the `opencode` provider (takes precedence over the keyless free tier). |
 | `OPENCODE_MODELS_URL` / `OPENCODE_MODELS_PATH` | Catalog source and cache path (same as upstream). |
 | `OPENCODE_DISABLE_MODELS_FETCH` | Disable catalog refresh. |
+| `OPENCODE_CONFIG` | Load an additional explicit config file over the global one (missing file warns; malformed is fatal). |
+| `OPENCODE_CONFIG_CONTENT` | Inline JSON merged as the final local config layer (launchers inject plugins this way). |
+| `OPENCODE_CONFIG_DIR` | Config directory (`opencode.json` + auto-discovered `plugin/`/`plugins/`); defaults to `$XDG_CONFIG_HOME/opencode` or `~/.config/opencode`. |

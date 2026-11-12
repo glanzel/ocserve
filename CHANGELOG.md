@@ -1,8 +1,195 @@
 # Changelog
 
-All notable changes to ocserve. The wire contract targets the frozen
-openccode 1.18.31 release and the v2 surface the 2.0.28 client; anything that
-differs is a named `D-*` row in the ledger at `PLAN.md §18`.
+All notable changes to ocserve. The wire contract targets the frozen opencode
+1.19.5 release and the v2 surface the 2.2.5 client; anything that differs is a
+named `D-*` row in the ledger at `PLAN.md` section 18.
+
+## 0.7.1 - 2026-11-10
+
+### Added
+- **Saved permissions are real state.** `GET /api/permission/saved` returned an
+  empty array and the PATCH/DELETE routes were 204 no-ops, while the shipped web
+  UI lists, edits and removes them. Backed now by schema v19 `permission_saved`
+  (project-scoped, unique on action + resource) with the reference's semantics:
+  idempotent save, partial update, 404 for a missing id, conflict on a
+  duplicate, and a bare delete that does not 404. An "always" reply writes the
+  project row as well as the session grant.
+- `scripts/remote-build.sh` offloads cargo to a builder host, because the
+  development box's `target/` reached 912 GB on a snapshot-pinned filesystem
+  and failed with ENOSPC more often than with compiler errors.
+
+### Changed
+- Dev builds default to a target dir OUTSIDE the snapshotted subvolume
+  (`scripts/remote-build.sh` now uses `/var/tmp/ocserve-build`): on btrfs with
+  snapper, deleting a 100 GB `target/` frees nothing while an hourly snapshot
+  still references the extents.
+- The nightly media corpus gate now tests what it claims to (attachment
+  ENCODING, with the corpus's own modalities) and the zen free-tier gate
+  reports a spent anonymous pool as a CONDITION rather than a wire
+  regression, while a plain 429, an auth failure and a stream stall remain
+  hard failures.
+- Dependency updates: rolldown 1.3.x, boring 5.4, brotli 9.1.1, toml 1.2.1,
+  rustix 1.1.6, flate2 1.1.11, similar 3.2.1. `boring` needed its requirement
+  raised, not only the lock.
+- CI actions: `setup-rust-toolchain` v2.0.1 (13 uses) and `upload-artifact`
+  v7.0.2 (5 uses), each pin verified against its upstream tag.
+
+### Fixed
+- **Scheduled wake-ups never fired.** The v2 `experimental.schedule.*` routes
+  shipped as storage only: create/list/get/pause/resume/delete worked, and no
+  runner existed, so a wake-up set in the web UI silently did nothing. A
+  runner now polls the due index every second (bounded by the nearest slot),
+  admits a deterministic `msg_<id>_<run>` steer prompt carrying
+  `metadata.schedule`, and records the reference's own state
+  (`lastFiredAt`, `lastOutcome`, `runCount`, `nextDueAt`). `every` keeps its
+  phase and skips missed slots, `cron` evaluates through an in-tree minute
+  walker, `in`/`at` are one-shots, `ends.times|after|at` bound the run, a
+  firing over 60 s late is marked `late`, a still-pending previous wake is
+  skipped and re-woken, and a failed turn backs off five minutes instead of
+  retrying every tick. Schema v18 adds the bookkeeping columns. Conditions
+  (`if`/`until`) are stored but not evaluated (`D-SCHEDULE-CHECK`).
+- **Five v2 operation families were bound from the contract, not the reference**
+  (2.2.5). A live differential found each was plausible-but-wrong:
+  `experimental.schedule` create REQUIRED a `type` key that upstream's untagged
+  `{in|at|every|cron}` input does not have, so every valid client payload was
+  rejected; `artifact` ids are branded by PREFIX only and PATCH decodes its
+  body before the id lookup and feature gate; `debug.heap-dump` answered a 500
+  where the contract requires a 200 (`path`, `pid`, five `memory` counters,
+  no extra keys); the artifacts family refused every call even with
+  `experimental.artifacts` on; `voice/session` transport is the discriminated
+  `VoiceTransportInput` union and its refusal is the provider's own; and
+  `client-mcp` GET answers a BARE 400 when a name is present (only the token
+  route carries the tagged refusal). `fs/watch` now resolves inside the session
+  location, so an existing file outside it is `FileNotFoundError`.
+  The 27 vectors are committed in `pair-v2-check` (55 total) with the feature
+  flags enabled in both temp HOMEs.
+- **A model with unknown capabilities is text-only.** An image sent to such a
+  model is now replaced with the explanatory text part (upstream's
+  `unsupportedParts`) instead of forwarded for the provider to reject;
+  config-declared models derive capabilities from `modalities`. A
+  `text/plain` data-URL attachment is expanded AT INGEST into the synthetic
+  Read-call line plus its body, and a turn with multiple parts is emitted as a
+  content ARRAY in part order rather than one concatenated string — capdiff
+  showed the merged form changed the prompt the model reads.
+- **A provider's `options.apiKey` was never used as the credential** (issue
+  #28), so every config-declared provider reached the upstream with an empty
+  bearer token. Auth layering now falls back config-first; the 2.x
+  `credential` table is a third source.
+- **The embedded commit stamp was one build behind** after a commit (HEAD is a
+  symbolic ref), and the offload path reported a foreign tree dirty. Both
+  fixed; the offload passes the LOCAL sha and dirty flag.
+
+- **The workspace picker accepted adapters the reference does not have.** `local`
+  and `directory` were treated as aliases of `worktree`, so a client could get a
+  `wrk_` id for a workspace that would never exist. The route now enforces the
+  probed rules: `worktree` is the only adapter, and it requires a git project,
+  each with the reference's own `WorkspaceCreateError` wording.
+
+- **The `/sync/*` routes answered undecodable bodies.** `POST /sync/replay` and
+  `POST /sync/steal` returned the literal `true`; `POST /sync/history` returned
+  `{data:[]}`. The contract wants `{sessionID}` and an array of
+  `{id,aggregate_id,seq,type,data}` respectively. Replay now validates
+  `{directory, events[]}` and appends the events; steal validates the `ses`
+  brand; history takes the per-aggregate watermark map and honours it. Caught
+  by `pair-check`'s spec validation, which had been reporting three violations
+  nobody read.
+- **A wrong POST body was invisible to the shape oracle.** `POST
+  /experimental/workspace` answered `{id,type}` where the contract requires
+  `{id,type,name,projectID,timeUsed}` and forbids extra keys; `spec-validate`
+  only walked GETs, so every gate stayed green. The validator now walks
+  parameterless POSTs, with a `--selftest` that fails on a body missing
+  required keys, wired into the guard suite. `DELETE /experimental/workspace/{id}`
+  also decodes the `wrk_` brand first (`nope` is a 400 `Params` error, as the
+  reference does) and answers 200 instead of a blanket 204. Create reports
+  `directory: null`, because the route creates nothing and a path it never made
+  is an answer a client would trust and then fail on.
+
+### Security
+- **RUSTSEC-2026-0459 / CVE-2026-119375** (SQLite before 3.54.0 could return
+  uninitialised page-cache memory when a database and a sibling `-wal` file
+  disagree on page size). The old `libsqlite3-sys` was pulled by `r2d2` and
+  `r2d2_sqlite`, both declared in `ocserve-store` and imported nowhere;
+  removing the two unused declarations let rusqlite 0.41 resolve
+  libsqlite3-sys 0.39.1 (SQLite 3.54.1).
+
+## Unreleased
+
+### Security
+- **`?base=` can no longer reach `git diff` as an option.** The v2 diff route
+  passed the query value straight through as a positional ref, so
+  `base=--output=/path` made the server write an attacker-chosen file and
+  `base=--ext-diff` re-enabled a repository's external diff driver (command
+  execution where one is configured). The value must now look like a ref and is
+  resolved with `git rev-parse --verify --end-of-options`; both `git diff`
+  calls also pass `--end-of-options`.
+
+### Fixed
+- **A malformed stored message could brick boot.** The v20 `msg.v2_type`
+  generated column called `json_extract` unguarded, and SQLite raises (rather
+  than returning NULL) on invalid JSON, so one bad imported row aborted the
+  index build and made every subsequent start fail. The expression is now
+  guarded with `json_valid` and classifies a malformed row as its role.
+- **The pre-migration snapshot now actually runs.** It lived in
+  `Writer::spawn`, but `serve` migrates in `boot_checks` before the writer
+  exists, so the writer saw an already-current database and skipped the
+  backup — the safety net never fired for the migration it exists for. It is
+  now taken inside `migrate`, which covers boot checks, the writer, the
+  importer and tests.
+- **Every declared query parameter on the message and session lists is read.**
+  The v2 message list accepted `?cursor=` and passed `None` down, so each page
+  returned the same first window with the same `next` cursor; a client walking
+  that chain grew to a 3.4 GB heap. Paging now advances, and the same route's
+  other three parameters work too: `order` (asc/desc, carried inside the
+  cursor), `type` (filtered in SQL before the limit, so a filtered page is
+  still full), and `previous` (emitted alongside `next`, as the reference
+  does). `cursor` with `order` is a 400 `InvalidCursorError`, an unknown
+  anchor id is an empty page, and an invalid `limit`/`order`/`type` is the
+  reference's own `InvalidRequestError` wording.
+- **The v2 session list honours its filters.** `?parentID=null` — the exact
+  call the shipped v2 web UI and TUI make to list root sessions — was treated
+  as the literal string `"null"` and returned ZERO sessions. It now means root
+  sessions. `archived`, `project`, `subpath`, `id` and a real cursor also
+  work; `PATCH /api/session {archived}` sets and clears the archive state.
+- **The v1 `/experimental/session` list pages.** `cursor`, `start`, `roots`
+  and `archived` were accepted and ignored, so older history was unreachable
+  through the offset-style cursor the endpoint advertises. It now applies the
+  reference's `time_updated` window and emits `x-next-cursor`.
+- **A failed plugin sidecar spawn is not retried forever.** A host without a
+  working `bun`/`node` re-materialized the host files and attempted a spawn
+  every config poll (2 s). The failure is now recorded once
+  (`ocserve_plugin_spawn_total{result}`) and discovery is disabled until
+  restart; the discovery pass is also bounded to 10 s so it cannot stall
+  config hot-reload.
+- **Plugin discovery happens off the request path.** `GET /api/plugin` did
+  synchronous directory scans and could spawn the plugin sidecar while a
+  launcher polled it every ~50 ms; discovery now runs on the config poller and
+  the route is a pure read.
+- **Two loader tests were reading the developer's real config.** With the
+  config directory as an env input, they asserted an exact plugin list against
+  whatever happened to be installed on the machine.
+
+### Added
+- **opencode v2 launcher compatibility (Paseo).** The config directory now
+  follows upstream (`OPENCODE_CONFIG_DIR` → `XDG_CONFIG_HOME/opencode` →
+  `~/.config/opencode`), plugin packages under `plugin/`/`plugins/` are
+  auto-discovered at boot and on inventory polls (so a launcher that
+  provisions a bridge after boot is picked up without a restart), and
+  `GET /api/plugin` serves the contract's `Plugin.Info` (`source`, `features`,
+  `state.status`) instead of a private `state:"loaded"` string. v2
+  `ctx.tool.transform` is now real: the editor runs, tools are advertised
+  with their JSON Schema and execute through the sidecar (`D-V2-TOOL-EDITOR`
+  closed).
+
+### Fixed
+- **Launcher-injected plugin config is read.** `OPENCODE_CONFIG` and
+  `OPENCODE_CONFIG_CONTENT` were documented upstream flags but never read, so
+  Paseo's bridge — a `plugin` tuple inside `OPENCODE_CONFIG_CONTENT` —
+  silently produced zero plugins and its `tool`/`shell.env` hooks were
+  missing. Both channels now layer last (content wins for scalars, plugin
+  declarations accumulate), `file://` plugin URLs
+  and plugin directories resolve, and the v2 `plugins: [{package, options}]`
+  form loads with `options ?? {}`. Malformed injected JSON fails boot loudly;
+  the value is never logged (it carries launcher tokens).
 
 ## 0.7.0
 

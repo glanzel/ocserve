@@ -6,7 +6,7 @@ use rusqlite::Connection;
 
 /// Bump when the schema changes; refuse to open mismatches with an actionable error
 /// (reliary8/stria pattern: schema.rs user_version gate).
-pub const SCHEMA_VERSION: i64 = 17;
+pub const SCHEMA_VERSION: i64 = 21;
 
 const DDL: &str = "
 -- session metadata (no payloads)
@@ -18,6 +18,9 @@ CREATE TABLE session (
     parent_id     TEXT,
     title         TEXT NOT NULL DEFAULT '',
     version       TEXT NOT NULL DEFAULT '1',
+    -- NULL = not archived. Upstream filters archived=true|false on this.
+    -- Kept nullable so omitting the filter (include both) is distinguishable.
+    time_archived INTEGER,
     path          TEXT NOT NULL DEFAULT '',
     agent         TEXT,
     model         TEXT,
@@ -53,6 +56,25 @@ CREATE TABLE msg (
 
 CREATE INDEX idx_msg_session ON msg(session_id, seq);
 CREATE INDEX idx_msg_page ON msg(session_id, time_created, id);
+
+-- v20: the v2 message-list `type=` filter runs in SQL BEFORE the limit.
+-- The column is derived, so every existing writer (insert_message, the
+-- importer, fork) fills it without an extra parameter: role is the base,
+-- and a user row marked `synthetic` is the `synthetic` type.
+-- Adding a writer must not bypass this: it is computed, not bound.
+ALTER TABLE msg ADD COLUMN v2_type TEXT
+    GENERATED ALWAYS AS (
+        CASE
+            WHEN role = 'user' THEN
+                CASE
+                    WHEN json_valid(info) AND json_extract(info, '$.synthetic') = 1
+                        THEN 'synthetic'
+                    ELSE 'user'
+                END
+            ELSE role
+        END
+    ) VIRTUAL;
+CREATE INDEX idx_msg_v2_type ON msg(session_id, v2_type, seq);
 
 -- parts: small payloads inline (≤8KB per MEMORY §6), large → blob store
 CREATE TABLE msg_part (
@@ -173,6 +195,21 @@ CREATE TABLE form (
 
 CREATE INDEX idx_form_session ON form(session_id, time_created);
 
+-- Project-level saved permissions ('always' with a scope that outlives the
+-- session). Upstream `PermissionTable` (permission/saved.ts); the unique index
+-- is what turns an edit into ConflictError rather than a duplicate row.
+CREATE TABLE permission_saved (
+    id             TEXT PRIMARY KEY,
+    project_id     TEXT NOT NULL,
+    action         TEXT NOT NULL,
+    resource       TEXT NOT NULL,
+    time_created   INTEGER NOT NULL,
+    time_updated   INTEGER NOT NULL
+) STRICT;
+CREATE UNIQUE INDEX idx_permission_saved_unique
+    ON permission_saved(project_id, action, resource);
+CREATE INDEX idx_permission_saved_project ON permission_saved(project_id);
+
 -- v2 credentials (gap closure): upstream `credential` table shape
 -- (verified live against 2.0.28: id/integration_id/label/value/active +
 -- created/updated; connector_id/method_id ride along nullable for OAuth
@@ -228,6 +265,12 @@ CREATE TABLE schedule (
     ends_at_ms     INTEGER,
     remaining_runs INTEGER,
     run_count      INTEGER NOT NULL DEFAULT 0,
+    last_fired_at  INTEGER,
+    last_outcome   TEXT,
+    checks         INTEGER NOT NULL DEFAULT 0,
+    failures       INTEGER NOT NULL DEFAULT 0,
+    retry_at       INTEGER,
+    last_message_id TEXT,
     time_created   INTEGER NOT NULL,
     time_updated   INTEGER NOT NULL
 ) STRICT;
@@ -331,6 +374,16 @@ CREATE INDEX idx_compaction_session ON compaction(session_id, time_ms);
 /// refuses anything else.
 pub fn migrate(conn: &Connection) -> Result<()> {
     let t0 = std::time::Instant::now();
+    // Pre-migration snapshot, taken HERE rather than in the writer.
+    //
+    // The backup used to live in `Writer::spawn`, which is too late on the
+    // `serve` path: `boot_checks` migrates the database before the writer is
+    // constructed (`ocserve-cli/src/lib.rs`), so the writer then saw
+    // `user_version == SCHEMA_VERSION` and skipped the backup — the safety net
+    // never fired for exactly the migration it exists for (found by the
+    // 2026-11-12 SRE review). Doing it inside `migrate` covers every caller:
+    // boot checks, the writer, the importer, and tests.
+    crate::writer::backup_before_migration(conn)?;
     apply_migrations(conn)?;
     let t1 = std::time::Instant::now();
     post_maintenance(conn)?;
@@ -930,6 +983,133 @@ CREATE TABLE IF NOT EXISTS session_environment (
                         ON session_goal(status);",
                     )?;
                 }
+                17 => {
+                    // v17->v18: schedule FIRING bookkeeping. v16 stored a
+                    // schedule and never ran it (shape without mutation), so a
+                    // user-created wake-up silently never happened. The runner
+                    // needs the reference's own state: when it last fired and
+                    // with what outcome, how many checks, consecutive failures,
+                    // a back-off instant, and the admitted message id (used to
+                    // reconcile a crash between admission and delivery).
+                    // Idempotent: migration-order tests rewind user_version.
+                    let cols: Vec<String> = conn
+                        .prepare("PRAGMA table_info(schedule)")?
+                        .query_map([], |r| r.get::<_, String>(1))?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    for (name, ddl) in [
+                        (
+                            "last_fired_at",
+                            "ALTER TABLE schedule ADD COLUMN last_fired_at INTEGER;",
+                        ),
+                        (
+                            "last_outcome",
+                            "ALTER TABLE schedule ADD COLUMN last_outcome TEXT;",
+                        ),
+                        (
+                            "checks",
+                            "ALTER TABLE schedule ADD COLUMN checks INTEGER NOT NULL DEFAULT 0;",
+                        ),
+                        (
+                            "failures",
+                            "ALTER TABLE schedule ADD COLUMN failures INTEGER NOT NULL DEFAULT 0;",
+                        ),
+                        (
+                            "retry_at",
+                            "ALTER TABLE schedule ADD COLUMN retry_at INTEGER;",
+                        ),
+                        (
+                            "last_message_id",
+                            "ALTER TABLE schedule ADD COLUMN last_message_id TEXT;",
+                        ),
+                    ] {
+                        if !cols.iter().any(|c| c == name) {
+                            conn.execute_batch(ddl)?;
+                        }
+                    }
+                }
+                18 => {
+                    // v18->v19: project-level saved permissions. `GET
+                    // /api/permission/saved` answered `[]` and the PATCH/DELETE
+                    // routes were 204 no-ops, yet the shipped web UI lists,
+                    // edits and removes saved permissions — so a user's "always
+                    // (this project)" vanished on the next screen. Upstream
+                    // keeps these in `PermissionTable`, keyed by project, with a
+                    // unique (project, action, resource) that makes a duplicate
+                    // edit a ConflictError. Pure CREATE.
+                    conn.execute_batch(
+                        "CREATE TABLE IF NOT EXISTS permission_saved (
+                        id             TEXT PRIMARY KEY,
+                        project_id     TEXT NOT NULL,
+                        action         TEXT NOT NULL,
+                        resource       TEXT NOT NULL,
+                        time_created   INTEGER NOT NULL,
+                        time_updated   INTEGER NOT NULL
+                    ) STRICT;
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_permission_saved_unique
+                        ON permission_saved(project_id, action, resource);
+                    CREATE INDEX IF NOT EXISTS idx_permission_saved_project
+                        ON permission_saved(project_id);",
+                    )?;
+                }
+                19 => {
+                    // v19->v20: the v2 message list declared `type=` and
+                    // `order=` on `GET /api/session/{id}/message` while the
+                    // handler read neither, so a filtered request silently got
+                    // every type. Filtering has to happen in SQL *before* the
+                    // limit or a page comes back short. The type is derived
+                    // (role + the `synthetic` marker), never bound by callers,
+                    // so no writer can forget it.
+                    //
+                    // Idempotent: a rewound version stamp (or a partially
+                    // applied step) must not re-ADD an existing column.
+                    //
+                    // `table_xinfo`, NOT `table_info`: the latter omits
+                    // generated columns entirely, so this check would never see
+                    // v2_type and the re-ADD would fail with "duplicate column
+                    // name" (found by the v9 rewind test).
+                    let cols: Vec<String> = conn
+                        .prepare("SELECT name FROM pragma_table_xinfo('msg')")?
+                        .query_map([], |r| r.get::<_, String>(0))?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    if !cols.iter().any(|c| c == "v2_type") {
+                        conn.execute_batch(
+                            "ALTER TABLE msg ADD COLUMN v2_type TEXT
+                                GENERATED ALWAYS AS (
+                                    CASE
+                                        WHEN role = 'user' THEN
+                                            CASE
+                                                WHEN json_valid(info) AND json_extract(info, '$.synthetic') = 1
+                                                    THEN 'synthetic'
+                                                ELSE 'user'
+                                            END
+                                        ELSE role
+                                    END
+                                ) VIRTUAL;",
+                        )?;
+                    }
+                    conn.execute_batch(
+                        "CREATE INDEX IF NOT EXISTS idx_msg_v2_type ON msg(session_id, v2_type, seq);",
+                    )?;
+                }
+                20 => {
+                    // v20->v21: the v2 session list declares `archived=` and the
+                    // handler ignored it, so archived sessions could not be
+                    // filtered out. Upstream stores a nullable `time_archived`
+                    // (NULL = live), which keeps "omit this filter" (include
+                    // both) distinguishable from `archived=false`.
+                    let cols: Vec<String> = conn
+                        .prepare("SELECT name FROM pragma_table_xinfo('session')")?
+                        .query_map([], |r| r.get::<_, String>(0))?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    if !cols.iter().any(|c| c == "time_archived") {
+                        conn.execute_batch(
+                            "ALTER TABLE session ADD COLUMN time_archived INTEGER;",
+                        )?;
+                    }
+                }
                 other => {
                     bail!(
                         "database schema version {other} out of step for {SCHEMA_VERSION}; \
@@ -1471,6 +1651,82 @@ mod sa_search {
             !plan.contains("TEMP B-TREE"),
             "no sort in the scoped shape: {plan}"
         );
+    }
+
+    /// A schema-advancing migration takes a restorable snapshot, on EVERY path.
+    ///
+    /// The snapshot used to live in `Writer::spawn`, so a `serve` boot — which
+    /// migrates in `boot_checks` BEFORE constructing the writer — skipped it
+    /// entirely (the writer then saw the already-current version). Nothing ran
+    /// the backup for the one case it exists for. It now lives in `migrate`.
+    #[test]
+    fn migrate_takes_a_pre_migration_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.db");
+        let conn = pragma::create_new(&p).unwrap();
+        migrate(&conn).unwrap();
+        conn.execute_batch("PRAGMA user_version = 19;").unwrap();
+        migrate(&conn).unwrap();
+
+        let safety = dir.path().join(".safety");
+        let snapshot = safety.join("ocserve-pre-v19.db");
+        assert!(
+            snapshot.exists(),
+            "the pre-migration snapshot must exist for a v19 DB"
+        );
+        let snap = rusqlite::Connection::open(&snapshot).unwrap();
+        let v: i64 = snap
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 19, "the snapshot is the pre-migration state");
+    }
+
+    /// A stored row with MALFORMED `info` JSON must not block v19→v20.
+    ///
+    /// `json_extract` RAISES on invalid JSON (verified on 3.53.0 and bundled
+    /// 3.54.1 — it does not return NULL), so an unguarded generated column made
+    /// `CREATE INDEX idx_msg_v2_type` abort and roll the step back: the server
+    /// then could not boot at all, permanently, retrying every start. The
+    /// importer copies legacy `data` verbatim and defaults `role` to "user" on a
+    /// parse failure, so exactly this row is producible from a legacy import.
+    #[test]
+    fn v20_migration_survives_malformed_info_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.db");
+        let conn = pragma::create_new(&p).unwrap();
+        migrate(&conn).unwrap();
+        // Rewind the version and drop the derived column, simulating a v19 DB.
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_msg_v2_type;
+             ALTER TABLE msg DROP COLUMN v2_type;
+             INSERT INTO session (id, project_id, directory, path, slug, title, version, time_created, time_updated)
+                 VALUES ('ses_bad','global','/w','s','s','t','1',1,1);
+             INSERT INTO msg (id, session_id, role, seq, time_created, info)
+                 VALUES ('msg_bad','ses_bad','user',1,1,'{not json');
+             INSERT INTO msg (id, session_id, role, seq, time_created, info)
+                 VALUES ('msg_ok','ses_bad','user',2,2,'{\"synthetic\":true}');
+             PRAGMA user_version = 19;",
+        )
+        .unwrap();
+        migrate(&conn).expect("v20 must migrate over a malformed row");
+        let ver: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(ver, SCHEMA_VERSION);
+        // The malformed row classifies as `user` (guarded → NULL → ELSE), and
+        // the well-formed synthetic row keeps its class.
+        let bad: String = conn
+            .query_row("SELECT v2_type FROM msg WHERE id='msg_bad'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let ok: String = conn
+            .query_row("SELECT v2_type FROM msg WHERE id='msg_ok'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(bad, "user", "malformed JSON falls back to the role");
+        assert_eq!(ok, "synthetic", "a valid marker still classifies");
     }
 
     /// v9→v10 migration preserves the recorded contract order exactly —
